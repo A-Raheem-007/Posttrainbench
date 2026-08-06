@@ -80,8 +80,12 @@ def main() -> None:
         score_display=False,
         log_realtime=False,
         log_format='json',
-        timeout=18000000,
-        attempt_timeout=18000000,
+        # Inspect uses seconds here. The previous 18,000,000 values allowed a
+        # single stuck request to wait for roughly 208 days, which looked like
+        # an endless Harbor run. tests/test.sh also applies a hard process
+        # timeout on top of this.
+        timeout=300,
+        attempt_timeout=300,
         max_tokens=args.max_tokens,
         max_connections=args.max_connections,
         **other_kwargs,
@@ -89,6 +93,13 @@ def main() -> None:
 
     if args.json_output_file is not None:
         assert len(eval_out) == 1, eval_out
+        if eval_out[0].results is None:
+            raise RuntimeError(
+                "Evaluation produced no results (eval_out[0].results is None) -- the "
+                "run was likely interrupted before completion (e.g. a sandbox output "
+                "limit or timeout abort partway through). See the inspect_ai output "
+                "above for details."
+            )
         assert len(eval_out[0].results.scores) == 1, eval_out[0].results.scores
         metrics = {}
         for k, v in eval_out[0].results.scores[0].metrics.items():

@@ -33,6 +33,7 @@ from evaluation_code.show_result import load_judgments, print_leaderboard
 API_MAX_RETRY = 3
 API_RETRY_SLEEP = 5
 DEFAULT_JUDGE_WORKERS = 64
+DEFAULT_ANSWER_WORKERS = 8
 VLLM_HEALTH_TIMEOUT = 600
 VLLM_REQUEST_TIMEOUT = 300
 VLLM_GENERATION_RETRY = 3
@@ -265,6 +266,8 @@ class VLLMServer:
             "--trust-remote-code",
             "--api-key",
             os.environ.get("VLLM_API_KEY", ""),
+            "--gpu-memory-utilization",
+            str(getattr(self.args, "gpu_memory_utilization", 0.9)),
         ]
         command.extend(template_args(self.args))
 
@@ -314,6 +317,14 @@ def generate_answers(args) -> tuple:
 
     Returns:
         Tuple of (output_path or None, dict mapping uid to answer record)
+
+    Answers are generated concurrently (ThreadPoolExecutor, same pattern the
+    judge phase below already uses) instead of one request at a time -- the
+    prior sequential version made only one HTTP request to vLLM in flight at
+    once, which is unnecessarily slow given vLLM's own request concurrency.
+    Each worker returns its own (uid, record) pair, so the results are
+    assembled into answers_dict sequentially after all requests complete --
+    no concurrent writes to shared state.
     """
     data_dir = DATA_PATH
     output_dir = data_dir / "model_answer"
@@ -333,7 +344,7 @@ def generate_answers(args) -> tuple:
         if vllm_api_key:
             session.headers["Authorization"] = f"Bearer {vllm_api_key}"
 
-        for question in tqdm(questions, desc="Generating answers"):
+        def generate_one(question) -> tuple:
             payload = {
                 "model": args.model_path,
                 "messages": [
@@ -394,7 +405,19 @@ def generate_answers(args) -> tuple:
                 "tstamp": time.time(),
                 "metadata": _make_metadata(answer_text),
             }
-            answers_dict[question["uid"]] = record
+            return question["uid"], record
+
+        print(
+            f"[generate] Generating answers for {len(questions)} questions "
+            f"({args.answer_workers} concurrent workers)"
+        )
+        with ThreadPoolExecutor(max_workers=args.answer_workers) as executor:
+            for uid, record in tqdm(
+                executor.map(generate_one, questions),
+                total=len(questions),
+                desc="Generating answers",
+            ):
+                answers_dict[uid] = record
 
         if args.store_outputs:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -702,6 +725,17 @@ def main():
     parser = argparse.ArgumentParser(description="Run Arena-Hard evaluation for local or Hugging Face models.")
     parser.add_argument("--model-path", required=True, help="Hugging Face model ID or local path.")
     parser.add_argument("--max-new-tokens", type=int, default=16384)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory vLLM may reserve at startup (vLLM's own "
+             "default is 0.9). Lower this if the GPU already has memory in "
+             "use from a prior process (e.g. an orphaned vLLM server "
+             "reparented to PID 1 that couldn't be killed) and vllm serve "
+             "fails with 'Free memory ... is less than desired GPU memory "
+             "utilization'.",
+    )
     # this is a good limit for this task, just keep it like that (or use less in case you want faster tests)
     parser.add_argument("--limit", type=int, default=32, help="Limit number of questions for quicker runs.")
     parser.add_argument(
@@ -709,6 +743,12 @@ def main():
         type=int,
         default=DEFAULT_JUDGE_WORKERS,
         help="Number of concurrent judge jobs to run in parallel.",
+    )
+    parser.add_argument(
+        "--answer-workers",
+        type=int,
+        default=DEFAULT_ANSWER_WORKERS,
+        help="Number of concurrent requests to vLLM during answer generation.",
     )
     parser.add_argument(
         '--templates-dir',

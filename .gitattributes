@@ -1,0 +1,34 @@
+# Force LF on everything textual, regardless of the cloner's core.autocrlf.
+#
+# This repo generates shell scripts that run inside Linux containers. A CRLF
+# shebang line ("#!/bin/bash\r") makes Linux refuse to exec the file at all,
+# failing with "bad interpreter: No such file or directory" before a single
+# line runs. That bug cost real debugging time here once already, and it is
+# invisible to `bash -n` and to normal file viewers. Anyone cloning on Windows
+# with core.autocrlf=true would reintroduce it without these rules.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.jinja text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cfg   text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.sif binary
+*.safetensors binary
+*.arrow binary
+*.parquet binary

@@ -1,0 +1,52 @@
+version = "1.0"
+
+# DIAGNOSTIC TASK -- not a benchmark. Probes whether LITERAL env values
+# placed directly in task.toml (per Data-OS's recommendation) actually
+# reach (a) the agent's process and (b) the verifier's process.
+#
+# Prior evidence on this harness: [agent.env] with "${VAR}" host
+# substitution was confirmed NOT to reach the oracle agent's process.
+# Data-OS suggests literal values instead; this task tests exactly that,
+# with DISTINCT dummy values per section so the logs show unambiguously
+# which section delivered to which phase. No real secrets anywhere.
+
+[metadata]
+author_name = "PostTrainBench Team"
+category = "diagnostics"
+tags = ["diagnostic", "env-delivery", "no-gpu"]
+
+# CPU-only, tiny, fast: no gpus/gpu_types on purpose. If platform
+# validation rejects a GPU-less task, add `gpus = 1` here (costs a few
+# idle GPU-minutes, changes nothing about the test).
+[environment]
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+build_timeout_sec = 1800.0
+allow_internet = true
+
+# v3: Data-OS says THIS is the supported section for agent+verifier env
+# delivery -- "[environment.env] injects variables into the sandbox
+# environment; [agent.env] is not a valid task-level section and is
+# ignored." Distinct marker so the report shows exactly this channel.
+[environment.env]
+DIAG_ENVIRONMENT_ENV = "chan-environment-env-ENV999"
+
+[verifier]
+timeout_sec = 600.0
+environment_mode = "shared"
+
+[verifier.env]
+HF_TOKEN = "tokentest-verifierenv-HF-VRF222"
+OPENAI_API_KEY = "tokentest-verifierenv-OAI-VRF333"
+
+[agent]
+timeout_sec = 900.0
+
+[agent.env]
+HF_TOKEN = "tokentest-agentenv-HF-AGT111"
+OPENAI_API_KEY = "tokentest-agentenv-OAI-AGT444"
+
+[[artifacts]]
+source = "/home/agent/workspace"
+destination = "workspace"

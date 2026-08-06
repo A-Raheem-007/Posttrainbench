@@ -17,6 +17,7 @@ import random
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -37,6 +38,7 @@ from evaluation_code.text_utils import limit_repetitions
 API_MAX_RETRY = 3
 API_RETRY_SLEEP = 5
 DEFAULT_JUDGE_WORKERS = 64
+DEFAULT_ANSWER_WORKERS = 8
 VLLM_HEALTH_TIMEOUT = 600
 VLLM_REQUEST_TIMEOUT = 300
 VLLM_GENERATION_RETRY = 3
@@ -108,6 +110,8 @@ class VLLMServer:
             "--trust-remote-code",
             "--api-key",
             os.environ.get("VLLM_API_KEY", ""),
+            "--gpu-memory-utilization",
+            str(getattr(self.args, "gpu_memory_utilization", 0.9)),
         ]
         command.extend(template_args(self.args))
 
@@ -190,7 +194,18 @@ def generate_answers(
     args,
     examples: List[HealthBenchExample]
 ) -> List[str]:
-    """Generate model responses for all examples."""
+    """Generate model responses for all examples.
+
+    Answers are generated concurrently (ThreadPoolExecutor, same pattern the
+    judge phase below already uses) instead of one request at a time -- the
+    prior sequential version made only one HTTP request to vLLM in flight at
+    once (confirmed via a real run: vLLM logs showed "Running: 1 reqs" for
+    the entire generation phase), so 245 examples took over 2 hours just to
+    generate answers, before judge grading even started. executor.map()
+    preserves the examples/responses positional correspondence that
+    downstream code (zip(examples, responses), grade_examples_parallel)
+    relies on, regardless of which requests complete first.
+    """
     server = VLLMServer(args, args.model_path)
     print(f"[generate] Starting vLLM server for model {args.model_path}")
 
@@ -202,13 +217,10 @@ def generate_answers(
         if vllm_api_key:
             session.headers["Authorization"] = f"Bearer {vllm_api_key}"
 
-        responses = []
-        print(f"[generate] Generating answers for {len(examples)} examples")
-        
-        for example in tqdm(examples, desc="Generating answers"):
+        def generate_one(example: HealthBenchExample) -> str:
             # Build messages from conversation
             messages = example.conversation.copy()
-            
+
             payload = {
                 "model": args.model_path,
                 "messages": messages,
@@ -250,9 +262,18 @@ def generate_answers(
                 answer_text = answer_text.split("</think>", maxsplit=1)[-1].strip()
 
             # Limit repetitive patterns in generated answer
-            answer_text = limit_repetitions(answer_text)
+            return limit_repetitions(answer_text)
 
-            responses.append(answer_text)
+        print(
+            f"[generate] Generating answers for {len(examples)} examples "
+            f"({args.answer_workers} concurrent workers)"
+        )
+        with ThreadPoolExecutor(max_workers=args.answer_workers) as executor:
+            responses = list(tqdm(
+                executor.map(generate_one, examples),
+                total=len(examples),
+                desc="Generating answers",
+            ))
 
         return responses
     finally:
@@ -280,6 +301,17 @@ def main():
         help="Hugging Face model ID or local path."
     )
     parser.add_argument("--max-new-tokens", type=int, default=16384)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="Fraction of GPU memory vLLM may reserve at startup (vLLM's own "
+             "default is 0.9). Lower this if the GPU already has memory in "
+             "use from a prior process (e.g. an orphaned vLLM server "
+             "reparented to PID 1 that couldn't be killed) and vllm serve "
+             "fails with 'Free memory ... is less than desired GPU memory "
+             "utilization'.",
+    )
     # this is a good limit for this task, you can keep it like that (or use less in case you want faster tests)
     parser.add_argument(
         "--limit",
@@ -292,6 +324,12 @@ def main():
         type=int,
         default=DEFAULT_JUDGE_WORKERS,
         help="Number of concurrent judge jobs to run in parallel."
+    )
+    parser.add_argument(
+        "--answer-workers",
+        type=int,
+        default=DEFAULT_ANSWER_WORKERS,
+        help="Number of concurrent requests to vLLM during answer generation."
     )
     # final evaluation will be done using the templates/ templates dir. You are not allowed to edit this directory.
     parser.add_argument(

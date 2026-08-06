@@ -51,7 +51,7 @@ RUN uv pip install --system --no-cache flash-attn==2.8.3 --no-build-isolation
 # Pinned agent CLIs (matches opus_4_6_1m.def).
 RUN npm install -g \
     @anthropic-ai/claude-code@2.1.76 \
-    @openai/codex@0.98.0 \
+    @openai/codex@0.146.0 \
     @google/gemini-cli@0.18.4 \
     opencode-ai@1.1.59
 
@@ -67,14 +67,14 @@ RUN cd /opt && \
     cd inspect_ai_vllm_stdout && \
     uv pip install --system --no-cache .
 
-# Entrypoint streams /logs/{agent,verifier}/*.txt to PID 1 stdout so Modal's
-# sandbox dashboard shows live agent + verifier output. Also kicks off a
-# system monitor daemon (parity with condor's src/utils/system_monitor.sh).
-# Healthcheck (in task.toml) writes /timer_start once the streaming daemon
-# is up.
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY system_monitor.sh /usr/local/bin/system_monitor.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/system_monitor.sh
+# NOTE: we intentionally do NOT set a custom ENTRYPOINT. The Turness/Modal
+# harness launches the sandbox with its own keepalive command and execs the
+# agent/healthcheck into it (same as the working ProgramBench tasks). A custom
+# ENTRYPOINT that `exec sleep infinity` swallows that launch command and the
+# sandbox fails to stabilize ("Sandbox ... already shut down" at healthcheck).
+# The Modal-dashboard live-log streaming this used to provide isn't needed on
+# Turness, which captures /logs itself. system_monitor.sh is still shipped in
+# the build context for anyone who wants to start it manually.
 
 # Workspace
 RUN mkdir -p /home/agent/workspace
@@ -90,5 +90,3 @@ RUN rm -f /home/agent/workspace/entrypoint.sh \
 
 RUN chmod -R a+rw /home/agent/workspace/ && \
     chmod +x /home/agent/workspace/timer.sh
-
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

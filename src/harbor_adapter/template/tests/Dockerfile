@@ -1,9 +1,13 @@
 FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
-# Verifier image for harbor's separate-verifier mode (PR #1655). Built
-# from `tests/` as context — Harbor builds this image whenever the
-# task's [verifier].environment_mode = "separate", and uploads the
-# agent's [[artifacts]] into the resulting container at the same paths.
+# Optional verifier image for installations that switch this task back to
+# Harbor's separate-verifier mode (PR #1655) after upgrading to a reliable
+# tar-based artifact transfer. The shipped task uses
+# [verifier].environment_mode = "shared" (see task.toml), where Harbor runs
+# the verifier inside the agent's own container and copies tests/ into
+# /tests at runtime instead of building this image — so this Dockerfile is
+# NOT built or used for normal evaluation today. Kept in sync anyway so the
+# switch back is a one-line task.toml edit, not a rebuild-from-scratch.
 #
 # Mirrors environment/Dockerfile (the agent image) so any Python the
 # verifier imports — vllm, transformers, inspect_evals — resolves
@@ -54,7 +58,7 @@ RUN uv pip install --system --no-cache flash-attn==2.8.3 --no-build-isolation
 
 # Codex CLI (contamination judge). Other agent CLIs deliberately omitted —
 # the verifier doesn't run an agent.
-RUN npm install -g @openai/codex@0.98.0
+RUN npm install -g @openai/codex@0.146.0
 
 RUN mkdir -p /opt && \
     cd /opt && \
@@ -68,12 +72,9 @@ RUN cd /opt && \
     cd inspect_ai_vllm_stdout && \
     uv pip install --system --no-cache .
 
-# Entrypoint streams /logs/{agent,verifier}/*.txt to PID 1 stdout (Modal
-# dashboard) and kicks off the system monitor. Healthcheck (in task.toml)
-# writes /timer_start once the streaming daemon is up.
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY system_monitor.sh /usr/local/bin/system_monitor.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/system_monitor.sh
+# NOTE: no custom ENTRYPOINT — same reasoning as environment/Dockerfile. The
+# Turness/Modal harness supplies the sandbox keepalive command and execs
+# test.sh into the verifier container itself.
 
 # Workspace exists but stays empty until the artifact transfer fills it.
 RUN mkdir -p /home/agent/workspace
@@ -91,5 +92,3 @@ RUN rm -f /tests/Dockerfile \
           /tests/system_monitor.sh \
           /tests/requirements-direct.txt && \
     chmod +x /tests/test.sh
-
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

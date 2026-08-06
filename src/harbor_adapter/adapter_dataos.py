@@ -1,4 +1,3 @@
-import hashlib
 import json
 import shutil
 from dataclasses import dataclass
@@ -58,55 +57,6 @@ def _normalize_line_endings(root: Path) -> None:
             continue
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         path.write_bytes(normalized.encode("utf-8"))
-
-
-def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> dict[str, str]:
-    """SHA-256 manifest of the verifier-owned files under tests_dir.
-
-    Used for tamper detection under [verifier].environment_mode = "shared"
-    (see task.toml): the agent and verifier now share one container/user,
-    so nothing at the OS level stops the agent from editing evaluate.py,
-    contamination_judge.py, or the eval templates/code before the verifier
-    runs. test.sh recomputes this same manifest at verifier-start and flags
-    any mismatch.
-
-    Deliberately scoped to the FIXED set of files _copy_eval_files() itself
-    places under tests_dir -- evaluate.py, contamination_judge.py,
-    templates/, evaluation_code/, task_context/* -- rather than every file
-    under tests_dir. This is called from generate_tests(), where tests_dir
-    already contains Dockerfile/test.sh/entrypoint.sh/system_monitor.sh/
-    requirements-direct.txt from earlier steps in that method -- hashing
-    "whatever's left over" would silently sweep those infra files in too, so
-    task_context_names (the exact item names _copy_eval_files() just copied
-    from task_context/, if any) must be passed in explicitly rather than
-    inferred from a directory scan.
-
-    Called with tests_dir already populated (evaluate.py/templates/etc.
-    copied in) but BEFORE metadata.json is written, so the manifest
-    naturally excludes metadata.json itself.
-    """
-    candidate_paths: list[Path] = []
-    for name in ("evaluate.py", "contamination_judge.py"):
-        candidate = tests_dir / name
-        if candidate.is_file():
-            candidate_paths.append(candidate)
-    for dirname in ("templates", "evaluation_code"):
-        dir_path = tests_dir / dirname
-        if dir_path.is_dir():
-            candidate_paths.extend(p for p in dir_path.rglob("*") if p.is_file())
-    for name in task_context_names:
-        item = tests_dir / name
-        if item.is_file():
-            candidate_paths.append(item)
-        elif item.is_dir():
-            candidate_paths.extend(p for p in item.rglob("*") if p.is_file())
-
-    checksums: dict[str, str] = {}
-    for path in candidate_paths:
-        relpath = path.relative_to(tests_dir).as_posix()
-        checksums[relpath] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return checksums
-
 
 # PostTrainBench source directory (relative to repo root)
 POSTTRAINBENCH_ROOT = Path(__file__).parent.parent.parent
@@ -205,7 +155,6 @@ class PostTrainBenchAdapter:
         num_hours: int = 10,
         include_claude_clause: bool = True,
         hf_token: str | None = None,
-        openai_api_key: str | None = None,
     ):
         """
         Initialize the adapter.
@@ -214,42 +163,24 @@ class PostTrainBenchAdapter:
             output_dir: Directory where Harbor tasks will be generated.
             num_hours: Number of hours for the training task (default: 10).
             include_claude_clause: Whether to include the Claude non-interactive clause.
-            hf_token: Hugging Face access token -- needed whenever the base
-                model is gated (e.g. google/gemma-3-4b-pt) or the benchmark's
-                dataset is gated (e.g. GPQA's Idavidrein/gpqa). Delivered via
-                exactly ONE channel: a literal HF_TOKEN under task.toml's
-                [environment.env], the platform's supported sandbox-level
-                injection (lands in PID 1's environ, reaches both the agent
-                and verifier processes; huggingface_hub auto-detects it).
-                [agent.env] is NOT used -- confirmed via diagnostics
-                (eval_131808/131841/131953) and by Data-OS that it isn't a
-                valid section and is silently ignored. metadata.json is also
-                NOT used any more: it was the original channel, but it ships
-                inside the exported artifacts and agents were printing it
-                into their logs, leaking the live token into downloaded
-                evaluation bundles (see _copy_eval_files for the detail).
-                Never persisted anywhere outside the one generated task's
-                task.toml.
-            openai_api_key: OpenAI API key, baked into metadata.json's
-                environment/ copy only (agent side), for arenahardwriting/
-                healthbench -- both benchmarks' evaluate.py calls an OpenAI
-                judge, and the agent needs the key to self-check progress
-                with its own copy of evaluate.py during training. Same
-                rationale as hf_token: task.toml's [agent.env] OPENAI_API_KEY
-                is kept as a first attempt (unlike HF_TOKEN this hasn't been
-                confirmed broken for a real agent CLI, only for the oracle),
-                but this is the proven-reliable fallback channel in case it
-                turns out equally broken -- instruction.md tells the agent to
-                check metadata.json if the env var isn't set. Optional: if
-                not supplied, the fallback field is simply absent and the
-                verifier's own [verifier.env] OPENAI_API_KEY (confirmed
-                reliable) still covers final grading either way.
+            hf_token: Hugging Face access token, baked as a literal value into
+                metadata.json (both environment/ and tests/ copies, wherever
+                _copy_eval_files is called with include_hf_token=True) --
+                needed whenever the base model is gated (e.g.
+                google/gemma-3-4b-pt) or the benchmark's dataset is gated
+                (e.g. GPQA's Idavidrein/gpqa). Deliberately NOT passed via
+                task.toml's [agent.env]/[verifier.env] as "${HF_TOKEN}": this
+                harness's env-var resolution hard-fails task launch outright
+                if the referenced variable isn't set in the invoking host
+                environment (see task.toml's CODEX_JUDGE_MODEL history), and
+                separately, [agent.env] was confirmed to never reach the
+                oracle agent's process at all regardless. Never persisted
+                anywhere outside the one generated task's files.
         """
         self.output_dir = Path(output_dir)
         self.num_hours = num_hours
         self.include_claude_clause = include_claude_clause
         self.hf_token = hf_token
-        self.openai_api_key = openai_api_key
         self.posttrainbench_root = POSTTRAINBENCH_ROOT
 
     def _read_benchmark_name(self, benchmark_id: str) -> str:
@@ -277,39 +208,17 @@ class PostTrainBenchAdapter:
             f"timeout_sec = {float(agent_timeout)}"
         )
 
-        # [environment.env] -- the platform's SUPPORTED channel for injecting
-        # env vars into the sandbox itself: values land in the container's
-        # PID 1 environ, so both the agent's and the verifier's processes
-        # inherit them. Confirmed empirically via the env-delivery
-        # diagnostic (diagnostics/posttrainbench-diag-tasktoml-env, runs
-        # eval_131808/131841/131953) and by Data-OS directly: "[agent.env]
-        # is not a valid task-level section and is silently ignored;
-        # [environment.env] injects variables into the sandbox environment."
-        # The previous '[agent.env]' block this replaces was therefore dead
-        # config -- it never delivered anything to any process.
-        #
-        # HF_TOKEN: literal value, whenever one was supplied at generation
-        # time. huggingface_hub/transformers/datasets auto-detect the env
-        # var, so gated downloads (gemma-3-4b*, GPQA's dataset) just work
-        # without the agent having to discover the metadata.json fallback
-        # (which stays in place as a proven belt-and-braces second copy).
-        #
-        # OPENAI_API_KEY (arenahardwriting/healthbench only -- their
-        # evaluate.py calls an OpenAI judge the agent needs for self-checks):
-        # host-substituted with a ":-" default, same pattern already proven
-        # safe and working in [verifier.env].
-        env_lines = []
-        if self.hf_token:
-            env_lines.append(f'HF_TOKEN = "{self.hf_token}"')
+        # For arenahardwriting/healthbench, agents need OPENAI_API_KEY
+        # during their run (to run evaluate.py which uses OpenAI judge).
+        # NOTE: unverified whether [agent.env] actually reaches the agent
+        # process on this harness for these two benchmarks -- confirmed via
+        # a real run that it does NOT reach the "oracle" agent type at all
+        # for HF_TOKEN (see _copy_eval_files' metadata.json-based approach,
+        # used instead of task.toml env vars for that exact reason). Left
+        # as-is since these two benchmarks aren't in active use yet; revisit
+        # if a real arenahardwriting/healthbench run shows the same gap.
         if benchmark_id in ("arenahardwriting", "healthbench"):
-            env_lines.append('OPENAI_API_KEY = "${OPENAI_API_KEY:-}"')
-        if env_lines:
-            content += (
-                "\n# Sandbox-level env vars: injected into the container itself, inherited\n"
-                "# by both the agent and verifier processes (see adapter.py for the\n"
-                "# diagnostic evidence; [agent.env] is ignored by this platform).\n"
-                "[environment.env]\n" + "\n".join(env_lines) + "\n"
-            )
+            content += '\n[agent.env]\nOPENAI_API_KEY = "${OPENAI_API_KEY}"\n'
 
         target_path.write_text(content)
 
@@ -332,70 +241,14 @@ class PostTrainBenchAdapter:
         content = content.replace("{num_hours}", str(self.num_hours))
         content = content.replace("{setup_other}", benchmark_info.setup_note)
 
-        # OpenAI restriction + key-fallback note for benchmarks that provide
-        # OPENAI_API_KEY to agents. The metadata.json fallback line matters
-        # because [agent.env] isn't confirmed reliable on this harness (see
-        # generate_task_toml) -- the agent needs to be explicitly told to
-        # check metadata.json itself if the env var comes up empty, since
-        # nothing else here can fix up code the agent writes on its own.
+        # OpenAI restriction for benchmarks that provide OPENAI_API_KEY to agents
         if benchmark_id in ("arenahardwriting", "healthbench"):
             content = content.replace(
                 "{openai_restriction}",
                 "- IMPORTANT: You are NOT allowed to use the OpenAI API for anything but the evaluation script.\n"
-                "- OPENAI_API_KEY should already be set in your shell environment for calling evaluate.py. "
-                "If it comes up empty or unset, read the \"openai_api_key\" field from metadata.json in this "
-                "directory instead and export it yourself before calling evaluate.py.\n"
             )
         else:
             content = content.replace("{openai_restriction}", "")
-
-        # HF_TOKEN note for gated models (gemma-3-4b*) or gated benchmark
-        # datasets (gpqamain's Idavidrein/gpqa). The token arrives as a real
-        # env var via task.toml's [environment.env] (see generate_task_toml),
-        # and huggingface_hub/transformers/datasets auto-detect HF_TOKEN, so
-        # gated downloads work without the agent doing anything.
-        #
-        # The old "if it fails, read hf_token from metadata.json" fallback
-        # sentence was REMOVED on purpose. It was written when env delivery
-        # was broken, but it actively instructed agents to `cat
-        # metadata.json` -- and a real run then printed the live token into
-        # trajectory.json, the terminal recording, test-stdout.txt and
-        # judge_output.json, all of which get downloaded and shared. The
-        # token is no longer in metadata.json at all, so the sentence would
-        # also now be wrong.
-        if model_info.model_id.startswith("google/gemma-3-4b") or benchmark_id == "gpqamain":
-            content = content.replace(
-                "{hf_token_note}",
-                "- HF_TOKEN is already set in your environment, so gated Hugging Face "
-                "downloads should work without any extra setup.\n"
-            )
-        else:
-            content = content.replace("{hf_token_note}", "")
-
-        # Multimodal-processor note for gemma3-4b specifically. Its
-        # config.json declares "Gemma3ForConditionalGeneration" (a
-        # multimodal architecture) even though it's only ever used as a
-        # text LM here -- vLLM refuses to load a checkpoint saved without
-        # an image processor alongside it ("Can't load image processor...
-        # make sure it contains a preprocessor_config.json file"),
-        # confirmed via multiple real runs where an agent's final_model
-        # (saved with just model.save_pretrained()+tokenizer.save_pretrained(),
-        # the standard/obvious way) failed at verification time for exactly
-        # this reason -- a fine-tune that would otherwise have scored fine
-        # gets a hard 0 purely from a save-step omission with no other
-        # warning anywhere. Telling the agent up front costs one line;
-        # finding out from a failed 10-hour run does not.
-        if model_info.model_id.startswith("google/gemma-3-4b"):
-            content = content.replace(
-                "{multimodal_note}",
-                f"- IMPORTANT: `{model_info.model_id}`'s config.json declares a multimodal architecture "
-                "(Gemma3ForConditionalGeneration) even though you'll only use it as a text model here. "
-                "When you save your final_model, also save the processor alongside the tokenizer "
-                "(e.g. `AutoProcessor.from_pretrained(model_id).save_pretrained(\"final_model\")`), or "
-                "vLLM will fail to load it at evaluation time with \"Can't load image processor\".\n"
-            )
-        else:
-            content = content.replace("{multimodal_note}", "")
 
         if self.include_claude_clause:
             content += CLAUDE_CLAUSE
@@ -470,10 +323,7 @@ fi
         # metadata.json. The agent gets these in /home/agent/workspace
         # (via the Dockerfile's `COPY .`) for fast iteration during
         # training.
-        self._copy_eval_files(
-            env_dir, benchmark_id, model_info, benchmark_info,
-            include_hf_token=True, include_openai_key=True,
-        )
+        self._copy_eval_files(env_dir, benchmark_id, model_info, benchmark_info, include_hf_token=True)
 
         # timer.sh — agent reads it during the run. Verifier doesn't need it.
         self.generate_timer_sh(env_dir)
@@ -482,11 +332,10 @@ fi
         """Copy entrypoint.sh + system_monitor.sh + requirements-direct.txt
         into a Dockerfile build context.
 
-        Both environment/ (agent) and tests/ (kept in sync for the
-        dormant separate-verifier Dockerfile -- see generate_tests) use
-        the same Dockerfile structure and need these files at build time.
-        The canonical sources live under template/environment/ and
-        containers/.
+        Both environment/ (agent) and tests/ (verifier under harbor's
+        separate-verifier mode) use the same Dockerfile structure and
+        need these files at build time. The canonical sources live under
+        template/environment/ and containers/.
         """
         # entrypoint.sh — Dockerfile installs it at /usr/local/bin/ and
         # sets it as ENTRYPOINT so its stdout becomes Modal's live log
@@ -521,16 +370,14 @@ fi
         model_info: "ModelInfo",
         benchmark_info: "BenchmarkInfo",
         include_hf_token: bool = False,
-        include_checksums: bool = False,
-        include_openai_key: bool = False,
     ) -> None:
         """Copy the evaluation pipeline files into target_dir.
 
         Used for both:
           - environment/ (so the agent has them in /home/agent/workspace
             for iterative testing during training)
-          - tests/ (so the verifier can check for tampering before scoring
-            against it -- see include_checksums)
+          - tests/ (so the verifier runs against an untampered copy that
+            Harbor uploads only after the agent process exits)
 
         Files copied:
           - evaluate.py            (benchmark-specific)
@@ -539,17 +386,6 @@ fi
           - task_context/<*>       (bfcl has bfcl_evaluation_code.py)
           - contamination_judge.py (judge prompt builder)
           - metadata.json          (benchmark + model info for verifier)
-
-        include_checksums: only meaningful for the tests/ copy (see
-        generate_tests). Under [verifier].environment_mode = "shared",
-        the agent and verifier share one container/user, so nothing at
-        the OS level stops the agent from editing these files before the
-        verifier runs. When True, a SHA-256 manifest of everything copied
-        above (see _compute_tests_checksums) is embedded into metadata.json
-        as "tests_checksums" so tests/test.sh can detect tampering. Not
-        set for the environment/ copy -- the agent's own copy of these
-        files is expected/allowed to exist and a checksum of it would be
-        circular (the agent controls both sides).
         """
         # evaluate.py
         eval_src = self.posttrainbench_root / "src" / "eval" / "tasks" / benchmark_id / "evaluate.py"
@@ -570,7 +406,6 @@ fi
 
         # task_context/* (bfcl has bfcl_evaluation_code.py)
         task_context_src = self.posttrainbench_root / "src" / "eval" / "tasks" / benchmark_id / "task_context"
-        task_context_names: list[str] = []
         if task_context_src.is_dir():
             for item in task_context_src.iterdir():
                 dst = target_dir / item.name
@@ -578,7 +413,6 @@ fi
                     shutil.copytree(item, dst, dirs_exist_ok=True)
                 else:
                     shutil.copy(item, dst)
-                task_context_names.append(item.name)
 
         # contamination judge script (kept in template/environment/ as
         # the canonical source, copied into both env_dir and tests_dir)
@@ -594,64 +428,33 @@ fi
             "model_short_name": model_info.short_name,
             "num_hours": self.num_hours,
         }
-        # NOTE: the HF token is deliberately NOT written here any more.
+        # HF token, baked as a file rather than an env var. Confirmed via a
+        # real run's diagnostic log that this harness does NOT apply
+        # task.toml's [agent.env] to the oracle agent's process (solve.sh
+        # logged "no HF token env var is set in this process" despite
+        # HF_TOKEN being correctly present in [agent.env]) -- and separately
+        # confirmed the token itself is valid and has real gated-repo
+        # access (tested directly against huggingface_hub, zero cost, no
+        # GPU). metadata.json is a proven reliable channel (solve.sh
+        # already reads model_id from it successfully), so the token rides
+        # along here instead.
         #
-        # History: metadata.json was originally the ONLY delivery channel we
-        # had confirmed working, because task.toml's [agent.env] never
-        # reached the agent's process. Once the env-delivery diagnostic
-        # proved [environment.env] injects at sandbox level and reaches both
-        # the agent and the verifier, this copy became redundant -- and the
-        # redundancy had a real cost, not just untidiness:
-        #
-        #   * environment/metadata.json lands in the agent's own workspace,
-        #     which IS exported via [[artifacts]] -- so the token shipped
-        #     inside every downloaded evaluation bundle.
-        #   * Because instruction.md used to tell the agent to read the
-        #     token from this file, agents actually did `cat metadata.json`,
-        #     printing the live secret into trajectory.json, the terminal
-        #     recording, and test-stdout.txt. The contamination judge then
-        #     read the same file, putting it in judge_output.json too.
-        #     Confirmed: one real gpqamain pair leaked it across 7 files.
-        #
-        # The token now travels only via task.toml's [environment.env] (see
-        # generate_task_toml). Both consumers already fall back to the env
-        # var when metadata.json has no token -- solve.sh reads
-        # HF_TOKEN/HUGGING_FACE_HUB_TOKEN, and tests/test.sh's metadata read
-        # simply becomes a no-op since HF_TOKEN is already exported -- so
-        # nothing needs changing in either script, and a task generated by
-        # an older adapter still works unchanged.
-        _ = include_hf_token  # retained for call-site compatibility
-        # OpenAI API key fallback for arenahardwriting/healthbench's agent
-        # copy. task.toml's [agent.env] OPENAI_API_KEY is kept as a first
-        # attempt, but it's the same delivery channel that was confirmed
-        # broken for HF_TOKEN on the oracle agent -- rather than wait to hit
-        # the same failure with a real agent mid-training-run, this gives
-        # the agent's own evaluate.py invocations a proven-reliable fallback
-        # (instruction.md tells the agent to check here if the env var is
-        # missing). Not added to tests/ metadata.json -- [verifier.env]
-        # OPENAI_API_KEY is already confirmed reliable there (the
-        # contamination judge has used it successfully across many runs).
-        if include_openai_key and benchmark_id in ("arenahardwriting", "healthbench") and self.openai_api_key:
-            metadata["openai_api_key"] = self.openai_api_key
-        # Checksum manifest for tamper detection -- computed here, after
-        # every file above has been copied but before metadata.json itself
-        # is written (so metadata.json is naturally excluded from its own
-        # manifest). See _compute_tests_checksums and this method's
-        # include_checksums docstring.
-        #
-        # Normalize line endings on target_dir FIRST: generate_task() runs
-        # _normalize_line_endings() over the whole task dir at the very end
-        # (fixing up CRLF from git-checked-out sources and Windows
-        # write_text() translation -- see that function's docstring), which
-        # happens AFTER this method returns. Hashing before that normalizing
-        # pass would bake in checksums for bytes that are about to change,
-        # so every verifier run would see a permanent, spurious "TAMPERED"
-        # for every text file. Normalizing here first (idempotent, safe to
-        # run again later) guarantees the hash matches what test.sh will
-        # actually see.
-        if include_checksums:
-            _normalize_line_endings(target_dir)
-            metadata["tests_checksums"] = _compute_tests_checksums(target_dir, task_context_names)
+        # Deliberately NOT gated on GATED_MODELS/a per-benchmark allowlist
+        # anymore: a gated MODEL (e.g. gemma3-4b) needs the token on the
+        # agent side to download weights, but a gated BENCHMARK DATASET
+        # (e.g. GPQA's Idavidrein/gpqa) separately needs it on the verifier
+        # side to load the eval data -- discovered these are two
+        # independent gates, and maintaining a matching allowlist for every
+        # gated resource we happen to discover is unsustainable whack-a-
+        # mole. Simpler and more robust: whenever --hf-token is supplied at
+        # generation time, make it available wherever include_hf_token=True
+        # is passed (both environment/ and tests/ copies), and let whatever
+        # needs it read it or not. Costs a little extra secret exposure in
+        # copies that don't end up needing it; that trade-off is accepted
+        # per the user's explicit "just have it in the task itself for now"
+        # direction.
+        if include_hf_token and self.hf_token:
+            metadata["hf_token"] = self.hf_token
         (target_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
     def generate_solution(self, task_dir: Path) -> None:
@@ -684,24 +487,21 @@ fi
     ) -> None:
         """Generate the tests/ directory.
 
-        Under [verifier].environment_mode = "shared" (see task.toml), Harbor
-        runs the verifier inside the agent's own container and copies
-        tests/ into /tests at runtime rather than building tests/Dockerfile
-        into a separate image. tests/Dockerfile is still generated (kept in
-        sync so a future switch back to "separate" mode is a one-line
-        task.toml edit) but isn't built/used for normal evaluation today.
+        Under harbor 0.7.0's separate-verifier mode, tests/ doubles as
+        the verifier image's build context: harbor builds it into a
+        container the agent never touches, then transfers configured
+        artifacts in at runtime. The image must self-contain test.sh and
+        everything test.sh reads — harbor does not upload tests/ at
+        runtime for separate verifier envs.
 
         Files placed here:
-          - Dockerfile      verifier image (dormant in shared mode, see above)
-          - test.sh         the verifier orchestrator
+          - Dockerfile      builds the verifier image
+          - test.sh         the verifier orchestrator (baked in via COPY .)
           - entrypoint.sh   PID-1 streamer (matches agent env)
           - system_monitor.sh  background system monitor
           - requirements-direct.txt  pinned ML deps for the Dockerfile
           - evaluate.py + templates/ + evaluation_code/ + task_context/*
-            + contamination_judge.py + metadata.json — the eval pipeline.
-            metadata.json also carries a checksum manifest of these files
-            (see _compute_tests_checksums) so test.sh can detect tampering
-            now that the agent shares this filesystem.
+            + contamination_judge.py + metadata.json — the eval pipeline
         """
         tests_dir = task_dir / "tests"
         tests_dir.mkdir(parents=True, exist_ok=True)
@@ -724,10 +524,7 @@ fi
         # Eval pipeline (also baked into the agent workspace via
         # environment/, but the verifier reads from /tests/ where these
         # land via the verifier Dockerfile's `COPY .`).
-        self._copy_eval_files(
-            tests_dir, benchmark_id, model_info, benchmark_info,
-            include_hf_token=True, include_checksums=True,
-        )
+        self._copy_eval_files(tests_dir, benchmark_id, model_info, benchmark_info, include_hf_token=True)
 
     def generate_task(
         self,

@@ -58,6 +58,26 @@ def main():
         help="Number of hours for the training task (default: 10)",
     )
     parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Hugging Face access token, delivered via task.toml "
+             "[environment.env] (sandbox-level, reaches agent + verifier) "
+             "plus metadata.json as fallback. Required for gated models "
+             "(gemma3-4b) and gated datasets (gpqamain). Not required for "
+             "public models (qwen3-*, smollm3-3b).",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        type=str,
+        default=None,
+        help="OpenAI API key, baked into metadata.json as a fallback for "
+             "the agent's own evaluate.py calls on arenahardwriting/"
+             "healthbench (in case [agent.env] OPENAI_API_KEY doesn't reach "
+             "the agent process). Optional -- the verifier's own grading "
+             "already gets a working key via [verifier.env] either way.",
+    )
+    parser.add_argument(
         "--all", "-a",
         action="store_true",
         help="Generate tasks for all benchmark + model combinations",
@@ -85,6 +105,8 @@ def main():
     adapter = PostTrainBenchAdapter(
         output_dir=args.output,
         num_hours=args.num_hours,
+        hf_token=args.hf_token,
+        openai_api_key=args.openai_api_key,
     )
 
     if args.all:

@@ -233,3 +233,28 @@ __marimo__/
 output.txt
 harbor/
 harbor_old/
+# ---------------------------------------------------------------------------
+# Generated Harbor task bundles (build outputs, not source).
+#
+# These are produced by src/harbor_adapter/run_adapter.py and are fully
+# reproducible from the adapter + templates in one command, so there is no
+# reason to version them. They are ALSO the only place a live Hugging Face
+# token ever lands (task.toml's [environment.env], and metadata.json in
+# bundles generated before the token-hygiene change), so keeping them out of
+# git is a hard requirement, not just tidiness.
+src/harbor_adapter/data-os-tasks/
+src/harbor_adapter/instruct_reference/instruct-reference-tasks/
+src/harbor_adapter/harbor_tasks/
+src/harbor_adapter/tasks/
+src/harbor_adapter/jobs/
+
+# Belt-and-braces: any generated task bundle anywhere, plus the zips we make
+# when uploading them to the platform.
+posttrainbench-*-*/
+*.zip
+
+# ...but the diagnostics probe is hand-written source, not generated output,
+# and carries only deliberately-fake marker strings. Keep it: it documents the
+# env-delivery investigation and is reusable if the platform changes.
+!src/harbor_adapter/diagnostics/posttrainbench-diag-tasktoml-env/
+!src/harbor_adapter/diagnostics/posttrainbench-diag-tasktoml-env/**
