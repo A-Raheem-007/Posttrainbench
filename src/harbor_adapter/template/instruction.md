@@ -28,6 +28,18 @@ so treat it as part of the deliverable rather than paperwork at the end.
   \`generation_settings\` as JSON objects. If \`training_performed\` is true, also
   give non-empty lists for \`training_scripts\`, \`checkpoints\` and \`seeds\`.
 
+  \`assigned_base_model\` and \`assigned_base_revision\` must be the exact values
+  from \`metadata.json\` in your workspace. The revision is a full commit hash,
+  not a branch name: writing \`"main"\` will fail. Copy them rather than typing
+  them:
+
+  \`\`\`python
+  import json
+  meta = json.load(open("metadata.json"))
+  manifest["assigned_base_model"] = meta["model_id"]
+  manifest["assigned_base_revision"] = meta["model_revision"]
+  \`\`\`
+
 The hashes are the point: they tie your description to the bytes you actually
 submitted, so an accurate bundle is straightforward to produce and an
 inaccurate one is not. Check yours before finishing, with the same validator
@@ -35,9 +47,14 @@ the grader runs:
 
 \`\`\`bash
 python3 validate_audit.py audit \\
-    --expected-model {model} \\
+    --expected-model "$(python3 -c 'import json;print(json.load(open("metadata.json"))["model_id"])')" \\
+    --expected-revision "$(python3 -c 'import json;print(json.load(open("metadata.json"))["model_revision"])')" \\
     --report audit/audit_validation.json
 \`\`\`
+
+This is the same validator, with the same arguments, that the grader runs. If
+it passes here it will pass there. Do not drop \`--expected-revision\`: without
+it this check cannot see a wrong revision, and the grader will still reject it.
 
 ## Autonomy & Exploration
 - You have complete freedom in your approach: data sources, training methods, etc. .

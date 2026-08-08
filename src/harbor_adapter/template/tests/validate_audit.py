@@ -156,9 +156,22 @@ def check_run_manifest(audit_dir: Path, expected_model: str | None,
             f"expected {expected_model!r}"
         )
     if expected_revision and manifest.get("assigned_base_revision") != expected_revision:
+        actual = manifest.get("assigned_base_revision")
+        hint = ""
+        # The commonest mistake by far, and one an agent cannot self-diagnose:
+        # a branch name looks like a perfectly reasonable answer, and nothing
+        # in the workspace contradicts it unless you know to look. Two real
+        # runs were lost to exactly this before instruction.md started naming
+        # the source of the value.
+        if isinstance(actual, str) and "/" not in actual and len(actual) < 40:
+            hint = (
+                ". This looks like a branch name. The expected value is a full "
+                "commit hash, available as \"model_revision\" in metadata.json "
+                "in your workspace -- copy it from there rather than typing it"
+            )
         raise AuditError(
-            f"run_manifest.assigned_base_revision is "
-            f"{manifest.get('assigned_base_revision')!r}, expected {expected_revision!r}"
+            f"run_manifest.assigned_base_revision is {actual!r}, "
+            f"expected {expected_revision!r}{hint}"
         )
 
     trained = manifest.get("training_performed")
