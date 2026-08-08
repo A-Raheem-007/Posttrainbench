@@ -86,7 +86,10 @@ def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> 
     naturally excludes metadata.json itself.
     """
     candidate_paths: list[Path] = []
-    for name in ("evaluate.py", "contamination_judge.py"):
+    # fetch_model.py is verifier-owned and security-relevant (it is what
+    # re-checks the transferred model's SHA-256 manifest), so it belongs in the
+    # tamper manifest alongside evaluate.py and the judge.
+    for name in ("evaluate.py", "contamination_judge.py", "fetch_model.py"):
         candidate = tests_dir / name
         if candidate.is_file():
             candidate_paths.append(candidate)
@@ -311,6 +314,29 @@ class PostTrainBenchAdapter:
                 "[environment.env]\n" + "\n".join(env_lines) + "\n"
             )
 
+        # The verifier is a SEPARATE container, so [environment.env] above does
+        # not reach it -- that section configures the agent's sandbox only.
+        # The relay repo is private, so without the token here the verifier
+        # authenticates as anonymous and snapshot_download fails with a 401
+        # that reads like "repo not found". Appended to the existing
+        # [verifier.env] block rather than emitting a second one, because a
+        # duplicate table key is a TOML parse error.
+        if self.hf_token:
+            marker = 'CODEX_API_KEY = "${OPENAI_API_KEY:-}"'
+            if marker not in content:
+                raise RuntimeError(
+                    "template/task.toml no longer contains the expected "
+                    "[verifier.env] anchor; HF_TOKEN would not reach the "
+                    "separate verifier and the relay download would 401."
+                )
+            content = content.replace(
+                marker,
+                marker
+                + "\n# Needed to pull the private relay repo (see [[verifier.collect]]).\n"
+                + f'HF_TOKEN = "{self.hf_token}"',
+                1,
+            )
+
         target_path.write_text(content)
 
     def generate_instruction(
@@ -473,6 +499,21 @@ fi
         self._copy_eval_files(
             env_dir, benchmark_id, model_info, benchmark_info,
             include_hf_token=True, include_openai_key=True,
+        )
+
+        # publish_model.py — the agent side of the HF relay. Not for the agent
+        # to run: the [[verifier.collect]] hook invokes it from
+        # /home/agent/workspace after the agent phase has ended, to push
+        # final_model to a private repo the verifier then pulls. It lands in
+        # the workspace via the Dockerfile's `COPY .`, which means the agent
+        # can tamper with it -- that is inherent to the agent having root in
+        # its own container, and is why model provenance is established by the
+        # verifier-side gates rather than by anything this script reports.
+        # Deleting it fails closed: no pointer is written, so the verifier
+        # scores 0 with a clear message.
+        shutil.copy(
+            TEMPLATE_DIR / "environment" / "publish_model.py",
+            env_dir / "publish_model.py",
         )
 
         # timer.sh — agent reads it during the run. Verifier doesn't need it.
@@ -720,6 +761,14 @@ fi
 
         # Build-context support files (same set the agent env needs).
         self._copy_build_context_support(tests_dir)
+
+        # fetch_model.py — the verifier side of the HF relay. Copied BEFORE
+        # _copy_eval_files so it exists when _compute_tests_checksums runs at
+        # the end of that call and therefore lands in the tamper manifest.
+        fetch_src = TEMPLATE_DIR / "tests" / "fetch_model.py"
+        fetch_dst = tests_dir / "fetch_model.py"
+        shutil.copy(fetch_src, fetch_dst)
+        fetch_dst.chmod(0o755)
 
         # Eval pipeline (also baked into the agent workspace via
         # environment/, but the verifier reads from /tests/ where these

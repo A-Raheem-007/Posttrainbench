@@ -64,7 +64,49 @@ allow_internet = true
 # the checks that run before it.
 [verifier]
 timeout_sec = 14400.0
-environment_mode = "shared"
+# Separate: the verifier runs in its own container, so the agent (which has
+# root in its own) cannot reach evaluate.py, the judges, or the reward logic.
+# That is the reference pipeline's design and what the client requires.
+#
+# This was previously "shared" because the model could not be moved into a
+# second container: normal artifact transfers are capped at 5 GiB per object
+# (SandboxFilesystemFileTooLargeError, eval_147030) and the /logs/artifacts
+# workaround fails to archive at 7.9 GB (eval_147559). The model now travels
+# outside Harbor entirely via the HF relay below, so the transfer limit no
+# longer constrains the architecture.
+environment_mode = "separate"
+
+# Mirrors [environment] so vLLM, flash-attn and model loading behave
+# identically on both sides.
+[verifier.environment]
+gpus = 1
+gpu_types = ["H100!"]
+cpus = 8
+memory_mb = 65536
+storage_mb = 102400
+build_timeout_sec = 3600.0
+allow_internet = true
+
+# Runs after the agent phase ends, before artifact capture, inside the agent's
+# container. Publishes the checkpoint to a private, randomly-named HF repo and
+# writes a few hundred bytes of pointer JSON that Harbor then carries.
+#
+# WHY NOT JUST DECLARE final_model AS AN ARTIFACT: Harbor copies every declared
+# artifact to the host output directory BEFORE the verifier starts and then
+# feeds the verifier FROM that host copy (artifact_handler.upload_artifacts()).
+# The verifier's input and the user's download are the same object, so any
+# model delivered that way is necessarily an 8 GB download that cannot be
+# retrieved. Measured in eval_147963: two identical 4 MB artifacts were
+# shipped, the verifier deleted one and left the other as a control, and both
+# arrived in the download at full size. There is no ArtifactConfig field that
+# excludes an entry from the output and no post-verify hook to clean it up.
+#
+# `|| true` is deliberately ABSENT: a publish failure must leave no pointer, so
+# the verifier fails closed with a clear message rather than grading nothing.
+[[verifier.collect]]
+service = "main"
+command = "bash -c 'set -eu; python3 /home/agent/workspace/publish_model.py --model-dir /home/agent/workspace/final_model --pointer /tmp/fm.pointer.json'"
+timeout_sec = 3600.0
 
 [verifier.env]
 # ":-" default (not a bare "${OPENAI_API_KEY}") so Harbor's resolve_env_vars()
@@ -96,6 +138,16 @@ timeout_sec = 36000.0
 # The contamination judge in test.sh reads the agent's code via
 # `cd $WORKSPACE && codex exec ...` — the workspace transfer supplies
 # everything under /home/agent/workspace/ minus the excludes below.
+# The only thing the relay needs Harbor to carry. A few hundred bytes: the
+# repo id, the pinned commit, and a per-file SHA-256 manifest the verifier
+# re-checks after download to detect a corrupted transfer.
+[[artifacts]]
+source = "/tmp/fm.pointer.json"
+destination = "fm.pointer.json"
+
+# The agent's source code, for the judges and for postmortem review.
+# final_model stays excluded: it travels via the relay, and including it here
+# would put the 8 GB back into the download, which is the whole problem.
 [[artifacts]]
 source = "/home/agent/workspace"
 destination = "workspace"

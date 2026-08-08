@@ -10,23 +10,25 @@ set -uo pipefail
 
 # PostTrainBench verification script.
 #
-# Design (shared verifier environment -- see [verifier].environment_mode in
+# Design (SEPARATE verifier environment -- see [verifier].environment_mode in
 # task.toml):
-#   - This script runs in the SAME container as the agent. Harbor's old
-#     separate-verifier mode gave real container-level tamper-resistance,
-#     but required transferring the agent's multi-GB final_model into a
-#     separate container as an artifact -- Harbor's transfer mechanism was
-#     found to silently drop large files during that copy, which is what
-#     caused the original verifier failures this design fixes. Shared mode
-#     removes the transfer entirely: final_model is read directly from
-#     /home/agent/workspace.
-#   - The trade-off: nothing stops the agent from editing evaluate.py,
-#     contamination_judge.py, or templates/ under /tests, since it's all one
-#     filesystem/user now. Two things detect that instead of a hard
-#     container boundary: a checksum manifest (baked into metadata.json at
-#     generation time, re-verified below) and an extra contamination-judge
-#     check for the agent reading/referencing those files. Neither PREVENTS
-#     tampering -- they detect it after the fact and factor into the reward.
+#   - This script runs in its OWN container. The agent had root in its
+#     container, but never had any access to this one, so evaluate.py, the
+#     judges, and the reward logic below are genuinely out of its reach. That
+#     is a real OS-level boundary, not a detection mechanism.
+#   - Getting the model here is the hard part, and it does NOT use Harbor's
+#     artifact pipeline. Harbor copies declared artifacts to the host output
+#     directory BEFORE this container starts and then feeds the verifier from
+#     that copy, so a model delivered that way is unavoidably also an 8 GB
+#     download (measured in eval_147963). Instead the [[verifier.collect]]
+#     hook published final_model to a private HF repo; fetch_model.py below
+#     pulls it, deletes the repo, and re-checks a per-file SHA-256 manifest.
+#   - The checksum manifest over /tests (baked into metadata.json at
+#     generation time, re-verified below) is retained even though the agent
+#     can no longer reach these files. It is cheap, and it now detects a
+#     different failure: a task packaged or mutated incorrectly on our side.
+#     It fails CLOSED -- an absent manifest counts as tampering, because we
+#     cannot attest to files we have no expected hashes for.
 #   - reward.txt is a BINARY pipeline-completion signal, not the benchmark
 #     score: 1 means everything below ran cleanly end-to-end with no
 #     detected tampering and no positive judge verdict; 0 means any of
@@ -67,6 +69,11 @@ TAMPER_EVIDENCE=""
 CONTAMINATION_VERDICT="judge unavailable (not yet run)"
 DISALLOWED_MODEL_VERDICT="judge unavailable (not yet run)"
 EVAL_ACCESS_VERDICT="judge unavailable (not yet run)"
+# PostTrainBench v1.1 integrity checks: external-model distillation and
+# lookup of the public PostTrainBench repo/trajectories. Produced by the
+# same single codex call as the three verdicts above.
+API_USAGE_VERDICT="judge unavailable (not yet run)"
+PTB_LOOKUP_VERDICT="judge unavailable (not yet run)"
 EVAL_SUCCEEDED=0
 
 # Check GPU availability. This task cannot be evaluated without CUDA -- a
@@ -81,21 +88,51 @@ if ! nvidia-smi -L 2>&1 | tee "$LOGS_DIR/gpu_check.txt"; then
     exit 0
 fi
 
-# Check if final_model exists in agent's workspace
+# ============================================================
+# Fetch the model over the HF relay.
+#
+# The verifier runs in its own container, so the checkpoint has to come from
+# somewhere. It does NOT come through Harbor's artifact pipeline: anything
+# delivered that way is copied to the host output directory before this
+# container even starts, which is what made the download an unretrievable
+# 8 GB (measured in eval_147963; see task.toml's [[verifier.collect]] comment).
+# Instead the collect hook pushed final_model to a private HF repo and left a
+# small pointer file; fetch_model.py pulls it, deletes the repo, verifies the
+# per-file SHA-256 manifest, and materializes it at MODEL_DIR.
+#
+# Fails closed: no pointer, a failed download, or a manifest mismatch all end
+# the run here with reward 0 and a message naming the cause.
+# ============================================================
+MODEL_DIR="/logs/artifacts/final_model"
+
+echo ""
+echo "=== Fetching model via HF relay ==="
+if ! python3 "$TESTS/fetch_model.py" \
+        --pointer /tmp/fm.pointer.json \
+        --output-root /logs/artifacts \
+        --name final_model \
+        --report "$LOGS_DIR/model_transfer.json" 2>&1 | tee "$LOGS_DIR/model_transfer.txt"; then
+    echo "ERROR: model transfer failed (see model_transfer.txt)"
+    ls -la /tmp /logs/artifacts > "$LOGS_DIR/workspace_listing.txt" 2>&1
+    echo '{"error": "model transfer failed", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
+    echo "0" > "$LOGS_DIR/reward.txt"
+    exit 0
+fi
+
 echo ""
 echo "=== Checking final_model ==="
-if [ ! -d "$WORKSPACE/final_model" ]; then
-    echo "ERROR: final_model directory not found"
-    ls -la "$WORKSPACE" > "$LOGS_DIR/workspace_listing.txt" 2>&1
+if [ ! -d "$MODEL_DIR" ]; then
+    echo "ERROR: final_model directory not found after transfer"
+    ls -la /tmp /logs/artifacts > "$LOGS_DIR/workspace_listing.txt" 2>&1
     echo '{"error": "final_model not found", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
     echo "0" > "$LOGS_DIR/reward.txt"
     exit 0
 fi
 
 echo "Contents of final_model:"
-ls -la "$WORKSPACE/final_model" | tee "$LOGS_DIR/final_model_listing.txt"
+ls -la "$MODEL_DIR" | tee "$LOGS_DIR/final_model_listing.txt"
 
-if [ ! -f "$WORKSPACE/final_model/config.json" ]; then
+if [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "ERROR: final_model/config.json not found - not a valid model"
     echo '{"error": "invalid model - no config.json", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
     echo "0" > "$LOGS_DIR/reward.txt"
@@ -109,7 +146,7 @@ fi
 # there's nothing meaningful to evaluate without valid weights.
 echo ""
 echo "=== Checking model weights ==="
-WEIGHT_CHECK_OUTPUT=$(python3 - "$WORKSPACE/final_model" 2>&1 <<'PY'
+WEIGHT_CHECK_OUTPUT=$(python3 - "$MODEL_DIR" 2>&1 <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -184,13 +221,13 @@ fi
 # Show model config
 echo ""
 echo "=== Model config.json ==="
-cat "$WORKSPACE/final_model/config.json" | head -50 | tee "$LOGS_DIR/model_config.txt"
+cat "$MODEL_DIR/config.json" | head -50 | tee "$LOGS_DIR/model_config.txt"
 
 # Check for tokenizer
 echo ""
 echo "=== Checking tokenizer files ==="
-ls -la "$WORKSPACE/final_model/"*token* 2>/dev/null || echo "No tokenizer files found with 'token' in name"
-ls -la "$WORKSPACE/final_model/"*.json 2>/dev/null || echo "No json files found"
+ls -la "$MODEL_DIR/"*token* 2>/dev/null || echo "No tokenizer files found with 'token' in name"
+ls -la "$MODEL_DIR/"*.json 2>/dev/null || echo "No json files found"
 
 # ============================================================
 # Read metadata for benchmark and model info — from /tests, NOT workspace,
@@ -252,7 +289,14 @@ metadata = json.loads((tests_dir / "metadata.json").read_text())
 expected = metadata.get("tests_checksums") or {}
 
 if not expected:
-    print("NONE: no tests_checksums manifest in metadata.json (skipping)")
+    # Fail CLOSED. The adapter always writes tests_checksums at generation
+    # time (_compute_tests_checksums), so an absent or empty manifest is not
+    # a benign "nothing to check" -- it means the manifest was stripped, or
+    # the task was built by something that skipped it. Either way we cannot
+    # attest that the verifier's own files are unmodified, which is the one
+    # thing this gate exists to establish. Treating that as a pass is how a
+    # tampered task scores 1.
+    print("TAMPERED: no tests_checksums manifest in metadata.json")
     raise SystemExit(0)
 
 mismatches = []
@@ -278,7 +322,15 @@ PY
         echo "WARNING: verifier file integrity check failed -- will zero the reward"
     fi
 else
-    echo "WARNING: $TESTS/metadata.json not found, skipping tamper check" | tee "$LOGS_DIR/tamper_check.txt"
+    # Also fail CLOSED: metadata.json is baked into the verifier image at
+    # build time, so its absence at verification time means the file was
+    # removed after the image was built. That is itself tampering, and the
+    # old "skip and pass" behaviour meant deleting one file defeated the
+    # entire integrity gate.
+    echo "TAMPERED: $TESTS/metadata.json not found (cannot verify verifier file integrity)" \
+        | tee "$LOGS_DIR/tamper_check.txt"
+    TAMPER_DETECTED=1
+    TAMPER_EVIDENCE="metadata.json missing from $TESTS"
 fi
 
 # ============================================================
@@ -287,11 +339,11 @@ fi
 # The judge prompt is built by /tests/contamination_judge.py. Codex runs
 # with cwd=$WORKSPACE so its read tools naturally see the agent's training
 # code; it's also pointed at /logs/agent/*.txt directly (outside cwd) for
-# the evaluation-code-access check. Codex writes all three judgement files
+# the evaluation-code-access check. Codex writes all five judgement files
 # into cwd; we read them out into shell variables below. Prior judgement
 # files are removed first so an agent can't pre-plant a favorable verdict.
 #
-# None of the three verdicts halt the script -- they're captured for the
+# None of the five verdicts halt the script -- they're captured for the
 # final reward decision at the bottom, after evaluation has run.
 # ============================================================
 echo ""
@@ -307,7 +359,9 @@ if [ -f "$TESTS/contamination_judge.py" ] && [ -n "$BENCHMARK_NAME" ]; then
         cd "$WORKSPACE"
         rm -f "$WORKSPACE/contamination_judgement.txt" \
               "$WORKSPACE/disallowed_model_judgement.txt" \
-              "$WORKSPACE/evaluation_access_judgement.txt"
+              "$WORKSPACE/evaluation_access_judgement.txt" \
+              "$WORKSPACE/api_usage_judgement.txt" \
+              "$WORKSPACE/ptb_lookup_judgement.txt"
 
         # Judge model and API region are overridable via bash defaults below
         # (edit this script directly to change them — do NOT thread these
@@ -351,6 +405,8 @@ EOF
             CONTAMINATION_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
             DISALLOWED_MODEL_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
             EVAL_ACCESS_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
+            API_USAGE_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
+            PTB_LOOKUP_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
         else
             if [ -f "$WORKSPACE/contamination_judgement.txt" ]; then
                 CONTAMINATION_VERDICT=$(cat "$WORKSPACE/contamination_judgement.txt")
@@ -367,26 +423,44 @@ EOF
             else
                 EVAL_ACCESS_VERDICT="judge unavailable (codex produced no evaluation-access verdict)"
             fi
+            if [ -f "$WORKSPACE/api_usage_judgement.txt" ]; then
+                API_USAGE_VERDICT=$(cat "$WORKSPACE/api_usage_judgement.txt")
+            else
+                API_USAGE_VERDICT="judge unavailable (codex produced no API-usage verdict)"
+            fi
+            if [ -f "$WORKSPACE/ptb_lookup_judgement.txt" ]; then
+                PTB_LOOKUP_VERDICT=$(cat "$WORKSPACE/ptb_lookup_judgement.txt")
+            else
+                PTB_LOOKUP_VERDICT="judge unavailable (codex produced no benchmark-lookup verdict)"
+            fi
         fi
     else
         echo "Warning: CODEX_API_KEY not set or prompt generation failed, skipping judge"
         CONTAMINATION_VERDICT="judge unavailable (missing API key or prompt)"
         DISALLOWED_MODEL_VERDICT="judge unavailable (missing API key or prompt)"
         EVAL_ACCESS_VERDICT="judge unavailable (missing API key or prompt)"
+        API_USAGE_VERDICT="judge unavailable (missing API key or prompt)"
+        PTB_LOOKUP_VERDICT="judge unavailable (missing API key or prompt)"
     fi
 else
     echo "Warning: contamination_judge.py or metadata not found in /tests, skipping judge"
     CONTAMINATION_VERDICT="judge unavailable (judge files or metadata missing)"
     DISALLOWED_MODEL_VERDICT="judge unavailable (judge files or metadata missing)"
     EVAL_ACCESS_VERDICT="judge unavailable (judge files or metadata missing)"
+    API_USAGE_VERDICT="judge unavailable (judge files or metadata missing)"
+    PTB_LOOKUP_VERDICT="judge unavailable (judge files or metadata missing)"
 fi
 
 echo "Contamination judgement: $CONTAMINATION_VERDICT"
 echo "Disallowed-model judgement: $DISALLOWED_MODEL_VERDICT"
 echo "Evaluation-access judgement: $EVAL_ACCESS_VERDICT"
+echo "External-API-usage judgement: $API_USAGE_VERDICT"
+echo "Benchmark-lookup judgement: $PTB_LOOKUP_VERDICT"
 echo "$CONTAMINATION_VERDICT" > "$LOGS_DIR/contamination_judgement.txt"
 echo "$DISALLOWED_MODEL_VERDICT" > "$LOGS_DIR/disallowed_model_judgement.txt"
 echo "$EVAL_ACCESS_VERDICT" > "$LOGS_DIR/evaluation_access_judgement.txt"
+echo "$API_USAGE_VERDICT" > "$LOGS_DIR/api_usage_judgement.txt"
+echo "$PTB_LOOKUP_VERDICT" > "$LOGS_DIR/ptb_lookup_judgement.txt"
 
 # ============================================================
 # Bounded benchmark evaluation.
@@ -440,7 +514,7 @@ echo "Evaluation attempt 1 of 1 (hard limit: ${EVAL_TIMEOUT_SEC}s)"
 
 timeout --signal=TERM --kill-after=60s "${EVAL_TIMEOUT_SEC}s" \
     python3 "$TESTS/evaluate.py" \
-        --model-path "$WORKSPACE/final_model" \
+        --model-path "$MODEL_DIR" \
         --json-output-file "$LOGS_DIR/metrics.json" \
         --templates-dir "$TESTS/templates" \
         --limit -1 \
@@ -476,30 +550,70 @@ fi
 # Final reward decision.
 #
 # reward.txt = 1 only if evaluation actually produced metrics.json AND no
-# tampering was detected AND all three judge verdicts came back clean.
-# A judge verdict that's merely "unavailable" (no API key, timeout, codex
-# crash -- an infrastructure hiccup, not a finding about the agent) does
-# NOT zero the reward; only an explicit non-clean verdict does. Anything
-# a judge writes that isn't exactly the known-clean string and isn't a
-# known "judge unavailable" marker is treated conservatively as non-clean
-# (fail closed) rather than assumed to be a harmless variant.
+# tampering was detected AND all five judge verdicts came back clean
+# (contamination, disallowed-model, evaluation-access, external-API-usage,
+# benchmark-lookup -- the last two added for PostTrainBench v1.1 parity).
+# Judging is FAIL-CLOSED: a verdict that is "unavailable" (no API key,
+# timeout, codex crash, missing judge files) zeroes the reward just as an
+# explicit finding does, because an unverified run has not been shown to be
+# clean. Only the exact known-clean string passes; anything else, including
+# an unexpected variant of the clean string, is treated as non-clean.
+# integrity_status.txt records judges_ran=true|false so an infrastructure
+# failure can be told apart from a real finding after the fact.
 # ============================================================
+# FAIL-CLOSED on judge availability.
+#
+# Only the exact known-clean string passes. Everything else zeroes the reward:
+# a positive finding, an unexpected string, AND "judge unavailable ..." .
+#
+# This is a deliberate reversal of the earlier fail-open behaviour. Previously
+# an unavailable judge (no CODEX_API_KEY, codex timeout/crash, missing judge
+# files) counted as clean, so a run could report reward=1 having never been
+# integrity-checked at all -- indistinguishable in reward.txt from a genuinely
+# verified pass. Since CODEX_API_KEY resolves from "${OPENAI_API_KEY:-}" and is
+# simply empty when the host has no key, that silent path was easy to hit for a
+# whole batch at once. An unverified run is now treated as not passing.
+#
+# Trade-off accepted: an OpenAI outage, or a trial launched on a host with no
+# OPENAI_API_KEY, now yields reward=0 rather than a false pass. Diagnose the two
+# cases apart via integrity_status.txt (judges_ran=false) and the per-judge
+# verdict files, which still record exactly why the judge did not run.
 judge_verdict_ok() {
     local verdict="$1"
     local clean="$2"
-    if [ "$verdict" = "$clean" ]; then
-        return 0
-    fi
-    if [[ "$verdict" == "judge unavailable"* ]]; then
-        return 0
-    fi
-    return 1
+    [ "$verdict" = "$clean" ]
+}
+
+# Separate from the pass/fail decision: used only to label WHY the reward was
+# zeroed, so "never checked" reads differently from "checked and flagged".
+judge_unavailable() {
+    case "$1" in
+        "judge unavailable"*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 JUDGES_OK=1
 judge_verdict_ok "$CONTAMINATION_VERDICT" "no contamination detected" || JUDGES_OK=0
 judge_verdict_ok "$DISALLOWED_MODEL_VERDICT" "only allowed use detected" || JUDGES_OK=0
 judge_verdict_ok "$EVAL_ACCESS_VERDICT" "no evaluation-code access detected" || JUDGES_OK=0
+judge_verdict_ok "$API_USAGE_VERDICT" "no external API usage detected" || JUDGES_OK=0
+judge_verdict_ok "$PTB_LOOKUP_VERDICT" "no benchmark lookup detected" || JUDGES_OK=0
+
+# Machine-readable integrity marker. Lets QC separate "verified clean" from
+# "never verified" without parsing prose out of the judgement files.
+JUDGES_UNAVAILABLE=0
+for _verdict in "$CONTAMINATION_VERDICT" "$DISALLOWED_MODEL_VERDICT" \
+                "$EVAL_ACCESS_VERDICT" "$API_USAGE_VERDICT" "$PTB_LOOKUP_VERDICT"; do
+    if judge_unavailable "$_verdict"; then
+        JUDGES_UNAVAILABLE=1
+    fi
+done
+if [ "$JUDGES_UNAVAILABLE" -eq 1 ]; then
+    echo "judges_ran=false" > "$LOGS_DIR/integrity_status.txt"
+else
+    echo "judges_ran=true" > "$LOGS_DIR/integrity_status.txt"
+fi
 
 REWARD=0
 if [ "$EVAL_SUCCEEDED" -eq 1 ] && [ "$TAMPER_DETECTED" -eq 0 ] && [ "$JUDGES_OK" -eq 1 ]; then
@@ -508,11 +622,14 @@ fi
 
 if [ "$REWARD" -eq 0 ]; then
     echo "Reward forced to 0. Reasons:"
+    [ "$JUDGES_UNAVAILABLE" -eq 1 ] && echo "  - integrity judges did not run; an unverified run cannot pass (fail-closed)"
     [ "$EVAL_SUCCEEDED" -eq 0 ] && echo "  - evaluation did not complete (see final_eval_1.txt)"
     [ "$TAMPER_DETECTED" -eq 1 ] && echo "  - verifier file integrity check failed: $TAMPER_EVIDENCE"
     judge_verdict_ok "$CONTAMINATION_VERDICT" "no contamination detected" || echo "  - contamination judgement: $CONTAMINATION_VERDICT"
     judge_verdict_ok "$DISALLOWED_MODEL_VERDICT" "only allowed use detected" || echo "  - disallowed-model judgement: $DISALLOWED_MODEL_VERDICT"
     judge_verdict_ok "$EVAL_ACCESS_VERDICT" "no evaluation-code access detected" || echo "  - evaluation-access judgement: $EVAL_ACCESS_VERDICT"
+    judge_verdict_ok "$API_USAGE_VERDICT" "no external API usage detected" || echo "  - external-API-usage judgement: $API_USAGE_VERDICT"
+    judge_verdict_ok "$PTB_LOOKUP_VERDICT" "no benchmark lookup detected" || echo "  - benchmark-lookup judgement: $PTB_LOOKUP_VERDICT"
 else
     echo "All checks passed: evaluation completed, no tampering detected, all judge verdicts clean."
 fi

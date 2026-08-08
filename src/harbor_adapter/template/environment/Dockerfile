@@ -14,7 +14,13 @@ ENV PATH="/root/.local/bin:$PATH"
 ENV NO_PROXY="localhost,127.0.0.1"
 ENV no_proxy="localhost,127.0.0.1"
 
-# System dependencies
+# System dependencies.
+#
+# tar/gzip/coreutils are listed explicitly even though the CUDA base image
+# ships them today. The collect hook and the verifier both shell out to
+# tar/gzip/sha256sum, and Harbor's own artifact transfer aborts with
+# "sandbox images must provide tar and gzip" if they are missing -- so an
+# undeclared dependency on someone else's base layer is not worth the risk.
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-dev \
@@ -23,6 +29,9 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     build-essential \
+    tar \
+    gzip \
+    coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Python symlinks

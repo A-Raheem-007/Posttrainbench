@@ -23,7 +23,9 @@ ENV PATH="/root/.local/bin:$PATH"
 ENV NO_PROXY="localhost,127.0.0.1"
 ENV no_proxy="localhost,127.0.0.1"
 
-# System dependencies
+# System dependencies. tar/gzip/coreutils listed explicitly for the same
+# reason as environment/Dockerfile: the verifier's integrity and transfer
+# paths shell out to them and must not depend on base-image contents.
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-dev \
@@ -32,6 +34,9 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     build-essential \
+    tar \
+    gzip \
+    coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Python symlinks

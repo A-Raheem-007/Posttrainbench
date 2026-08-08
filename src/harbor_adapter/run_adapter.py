@@ -102,6 +102,24 @@ def main():
             print(f"  {task_id}")
         return
 
+    # --hf-token is now REQUIRED for every task, not just gated models.
+    # The separate verifier gets the trained checkpoint over the HF relay
+    # (see task.toml's [[verifier.collect]]), which CREATES a private repo --
+    # so the token must exist and must be write-scoped even when the base
+    # model itself is public. Failing here, at generation time, beats
+    # discovering it ~40 minutes into a run when the collect hook cannot
+    # create a repo.
+    if not args.hf_token:
+        parser.error(
+            "--hf-token is required.\n"
+            "  The verifier runs in a separate container and receives the trained\n"
+            "  model via a private Hugging Face repo, so generation needs a\n"
+            "  WRITE-scoped token even for public base models.\n"
+            "  Create one at https://huggingface.co/settings/tokens with write\n"
+            "  access (a fine-grained token limited to repo create/delete in\n"
+            "  your own namespace is sufficient, and is what we recommend)."
+        )
+
     adapter = PostTrainBenchAdapter(
         output_dir=args.output,
         num_hours=args.num_hours,
