@@ -89,6 +89,41 @@ check("missing fingerprint fails closed",
       lambda: ident.check(trained_dir, {**IDENTITY, "architecture": {}}),
       want_error_fragment="no architecture fingerprint")
 
+# Regression: a field OMITTED from the saved config is not a mismatch.
+#
+# transformers' save_pretrained uses to_diff_dict(), which drops any value
+# equal to the config class default. tie_word_embeddings defaults to True, so
+# an honest fine-tune whose value IS True has the key removed on save even
+# though the base model's published config lists it. eval_152211 was failed on
+# exactly this, with every other field matching, and "violation" reads as an
+# accusation of submitting the wrong model.
+omitted = tmp / "omitted_default"
+omitted.mkdir()
+cfg_omitted = {k: v for k, v in ARCH.items() if k != "tie_word_embeddings"}
+cfg_omitted["architectures"] = ["Qwen3ForCausalLM"]
+(omitted / "config.json").write_text(json.dumps(cfg_omitted))
+(omitted / "model.safetensors").write_bytes(trained_bytes)
+check("field omitted as a class default is not a violation",
+      lambda: ident.check(omitted, IDENTITY), want_status="derived")
+
+# ...but a field PRESENT with the wrong value still is.
+wrong_value = tmp / "wrong_value"
+wrong_value.mkdir()
+(wrong_value / "config.json").write_text(json.dumps({
+    **ARCH, "tie_word_embeddings": False, "architectures": ["Qwen3ForCausalLM"],
+}))
+(wrong_value / "model.safetensors").write_bytes(trained_bytes)
+check("field present with a different value is still a violation",
+      lambda: ident.check(wrong_value, IDENTITY), want_status="violation")
+
+# And omission must not become a way to smuggle the prohibited checkpoint.
+omitted_instruct = tmp / "omitted_instruct"
+omitted_instruct.mkdir()
+(omitted_instruct / "config.json").write_text(json.dumps(cfg_omitted))
+(omitted_instruct / "model.safetensors").write_bytes(instruct_bytes)
+check("prohibited weights still caught when fields are omitted",
+      lambda: ident.check(omitted_instruct, IDENTITY), want_status="violation")
+
 # Regression: Gemma-3 text-only extraction must NOT be flagged.
 # Agents legitimately drop the vision tower of a multimodal base model for a
 # text-only benchmark, which changes model_type gemma3 -> gemma3_text and

@@ -127,7 +127,30 @@ def check(model_dir: Path, identity: dict) -> dict:
             "metadata.json carries no architecture fingerprint; this task was "
             "generated without model identity pinning and cannot be checked"
         )
+    # An ABSENT field is not a mismatch.
+    #
+    # transformers' save_pretrained writes config via to_diff_dict(), which
+    # omits any value equal to the config class default. tie_word_embeddings
+    # defaults to True, so a model whose value IS True gets the key dropped
+    # entirely on save -- even though the base model's published config lists
+    # it explicitly. eval_152211 was failed on exactly this: an honest SmolLM3
+    # fine-tune, every other field matching, accused of being a different
+    # model because one key had been omitted as a default.
+    #
+    # That is systematic, not a one-off: it would fire for essentially every
+    # real fine-tune, and "violation" reads as an integrity accusation rather
+    # than a packaging quirk.
+    #
+    # We cannot distinguish "absent because it equals the default" from
+    # "absent because someone stripped it" without instantiating the config
+    # class, so absence is recorded and skipped rather than accused. Nothing is
+    # lost: substitution is caught by the weight hashes below, which is the
+    # check that actually separates the base model from its instruct sibling.
+    absent: list[str] = []
     for field, expected_value in sorted(expected_arch.items()):
+        if field not in flat:
+            absent.append(field)
+            continue
         actual = flat.get(field)
         if field == "model_type":
             if not _equivalent(actual, expected_value, MODEL_TYPE_EQUIVALENCES):
@@ -196,6 +219,11 @@ def check(model_dir: Path, identity: dict) -> dict:
         "assigned_revision": identity.get("assigned_revision"),
         "weight_file_count": len(weights),
         "architecture_issues": issues,
+        # Recorded, not penalised. If this ever grows to cover most of the
+        # fingerprint, the architecture arm has quietly stopped checking
+        # anything and that should be visible rather than silent.
+        "architecture_fields_absent": absent,
+        "architecture_fields_compared": len(expected_arch) - len(absent),
     }
 
 
