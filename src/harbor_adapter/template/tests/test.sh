@@ -526,13 +526,27 @@ EOF
             JUDGE_EXIT_CODE=$?
             echo "Judge exit code: $JUDGE_EXIT_CODE"
 
-            # "Delivered" means codex exited cleanly AND actually wrote a
-            # verdict. Either half missing is a transport failure worth one
-            # more try.
-            if [ "$JUDGE_EXIT_CODE" -eq 0 ] && [ -f "$WORKSPACE/contamination_judgement.txt" ]; then
+            # "Delivered" means codex exited cleanly AND wrote ALL FIVE
+            # verdicts.
+            #
+            # Checking only one file was a real bug (eval_150949): codex
+            # exited 0, wrote four judgements, and signed off with "all four
+            # judgements reflect that" -- it simply lost track of the fifth
+            # topic. Because contamination_judgement.txt existed, this was
+            # scored as delivered, the loop broke, and the retry that exists
+            # for exactly this case never fired. The run still failed closed,
+            # but it burned its second chance for nothing.
+            JUDGE_MISSING=""
+            for _vf in contamination disallowed_model evaluation_access \
+                       api_usage ptb_lookup; do
+                [ -f "$WORKSPACE/${_vf}_judgement.txt" ] || JUDGE_MISSING="$JUDGE_MISSING ${_vf}"
+            done
+
+            if [ "$JUDGE_EXIT_CODE" -eq 0 ] && [ -z "$JUDGE_MISSING" ]; then
                 JUDGE_DELIVERED=1
                 break
             fi
+            [ -n "$JUDGE_MISSING" ] && echo "Missing verdict file(s):$JUDGE_MISSING"
 
             echo "Judge attempt $JUDGE_ATTEMPT delivered no verdict (exit $JUDGE_EXIT_CODE)."
             echo "Treating as a transport failure, not as a finding."
