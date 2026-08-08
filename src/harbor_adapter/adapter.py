@@ -1,7 +1,7 @@
 import hashlib
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ADAPTER_NAME = "POSTTRAINBENCH"
@@ -280,6 +280,19 @@ class BenchmarkInfo:
     task_id: str           # e.g., "gsm8k"
     benchmark_name: str    # e.g., "GSM8K (Grade School Math 8K)"
     setup_note: str = ""   # Additional setup instructions
+    # Which evaluation harness this benchmark's evaluate.py uses.
+    #
+    # Five of the seven call inspect_ai and leave a machine-readable log that
+    # validate_eval_evidence.py cross-checks metrics.json against. healthbench
+    # and arenahardwriting instead run their own generate-then-grade loop with
+    # an OpenAI grader and produce NO inspect log at all -- so demanding one
+    # rejects every honest run of those two (measured: eval_151149).
+    #
+    # This travels in metadata.json and is chosen per benchmark at generation
+    # time, deliberately NOT inferred from whether a log happens to exist.
+    # Inferring would mean deleting the log silently downgrades a strict check
+    # into a lenient one.
+    uses_inspect: bool = True
 
 
 @dataclass
@@ -330,15 +343,20 @@ BENCHMARKS = {
         setup_note="- A final note: the evaluate.py script sometimes outputs ERROR warnings. "
                    "Do not be alarmed by this, this is normal behavior for inspect-ai.\n"
     ),
+    # The two custom-harness benchmarks: their evaluate.py runs its own
+    # generate-then-grade loop against an OpenAI grader instead of inspect_ai,
+    # so there is no inspect log to cross-check metrics.json against.
     "arenahardwriting": BenchmarkInfo(
         task_id="arenahardwriting",
         benchmark_name="Arena-Hard-v2.0 (Writing)",
         setup_note="",
+        uses_inspect=False,
     ),
     "healthbench": BenchmarkInfo(
         task_id="healthbench",
         benchmark_name="HealthBench",
         setup_note="",
+        uses_inspect=False,
     ),
 }
 
@@ -822,6 +840,9 @@ fi
             # revision string is shared -- the weight hashes stay
             # verifier-only (see the model_identity block below).
             "model_revision": self._model_identity(model_info)["assigned_revision"],
+            # Tells test.sh which evidence rules apply to this benchmark. See
+            # BenchmarkInfo.uses_inspect.
+            "eval_harness": "inspect" if benchmark_info.uses_inspect else "custom",
             "num_hours": self.num_hours,
         }
         # NOTE: the HF token is deliberately NOT written here any more.
@@ -1042,12 +1063,19 @@ fi
         benchmark_info = BENCHMARKS[benchmark_id]
         model_info = MODELS[model_key]
 
-        # Try to get actual benchmark name from file
+        # Try to get actual benchmark name from file.
+        #
+        # dataclasses.replace(), NOT a fresh BenchmarkInfo(...). Reconstructing
+        # by hand silently drops any field the call site does not list: that is
+        # how uses_inspect reverted to its True default for healthbench and
+        # arenahardwriting, which routed them into the inspect evidence rules
+        # and rejected every honest run (eval_151149). replace() carries every
+        # field through, so adding a field to BenchmarkInfo can never
+        # reintroduce this.
         try:
-            benchmark_info = BenchmarkInfo(
-                task_id=benchmark_info.task_id,
+            benchmark_info = replace(
+                benchmark_info,
                 benchmark_name=self._read_benchmark_name(benchmark_id),
-                setup_note=benchmark_info.setup_note,
             )
         except FileNotFoundError:
             pass  # Use default from dataclass

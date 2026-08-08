@@ -110,7 +110,61 @@ def sample_count(payload: dict):
     return None
 
 
-def validate(metrics_path: Path, log_dir: Path) -> dict:
+def validate_custom_harness(metrics: dict, accuracy: float) -> dict:
+    """Evidence rules for benchmarks that do not use inspect_ai.
+
+    healthbench and arenahardwriting run their own generate-then-grade loop
+    against an OpenAI grader. There is no inspect log, so the cross-check that
+    catches a fabricated metrics.json on the other five benchmarks is simply
+    not available here, and pretending otherwise would mean rejecting every
+    honest run (which is what happened in eval_151149).
+
+    What IS checkable: the result has to look like a real graded run rather
+    than a stub. Both harnesses emit stderr alongside accuracy, and
+    healthbench additionally reports how many examples it graded.
+
+    This is genuinely weaker than the inspect path, and the returned report
+    says so rather than implying an equivalent guarantee.
+    """
+    stderr = metrics.get("stderr")
+    if isinstance(stderr, bool) or not isinstance(stderr, (int, float)):
+        raise EvidenceError(
+            f"metrics.json has no numeric stderr: {stderr!r}. Both custom-harness "
+            "benchmarks emit one, so its absence means this is not a completed run."
+        )
+    if float(stderr) < 0:
+        raise EvidenceError(f"metrics.json stderr is negative: {stderr!r}")
+
+    # healthbench only; arenahardwriting does not report it.
+    sample_count = metrics.get("n_examples")
+    if sample_count is not None:
+        if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+            raise EvidenceError(f"metrics.json n_examples is not an integer: {sample_count!r}")
+        if sample_count <= 0:
+            raise EvidenceError(f"metrics.json reports {sample_count} graded examples")
+
+    # A zero-everything result is what an empty or failed run produces.
+    if float(accuracy) == 0.0 and float(stderr) == 0.0 and not sample_count:
+        raise EvidenceError(
+            "metrics.json reports accuracy 0 with stderr 0 and no example count; "
+            "this is the shape both harnesses emit when no battles or gradings "
+            "were recorded, not a completed evaluation"
+        )
+
+    return {
+        "status": "ok",
+        "harness": "custom",
+        "accuracy": float(accuracy),
+        "stderr": float(stderr),
+        "sample_count": sample_count,
+        "limit": None,
+        # Stated explicitly so nobody reads this as the same guarantee the
+        # inspect path provides.
+        "raw_log_cross_check": "unavailable for this harness",
+    }
+
+
+def validate(metrics_path: Path, log_dir: Path, harness: str = "inspect") -> dict:
     metrics = load_json(metrics_path)
 
     accuracy = metrics.get("accuracy")
@@ -118,6 +172,9 @@ def validate(metrics_path: Path, log_dir: Path) -> dict:
         raise EvidenceError(f"metrics.json has no numeric accuracy: {accuracy!r}")
     if not 0.0 <= float(accuracy) <= 1.0:
         raise EvidenceError(f"metrics.json accuracy out of range: {accuracy!r}")
+
+    if harness == "custom":
+        return validate_custom_harness(metrics, float(accuracy))
 
     if not log_dir.is_dir():
         raise EvidenceError(f"inspect log directory {log_dir} does not exist")
@@ -154,10 +211,12 @@ def validate(metrics_path: Path, log_dir: Path) -> dict:
 
     return {
         "status": "ok",
+        "harness": "inspect",
         "log": str(log_path),
         "accuracy": float(accuracy),
         "sample_count": count,
         "limit": None,
+        "raw_log_cross_check": "accuracy matches the inspect log",
     }
 
 
@@ -165,19 +224,37 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--log-dir", required=True)
+    parser.add_argument(
+        "--harness",
+        default="inspect",
+        choices=("inspect", "custom"),
+        help="Which evidence rules apply. Comes from metadata.json's "
+             "eval_harness, set per benchmark at generation time -- NOT "
+             "inferred from what is on disk, or deleting a log would "
+             "downgrade the strict check into the lenient one.",
+    )
     parser.add_argument("--report", default=None)
     args = parser.parse_args()
 
-    result = validate(Path(args.metrics), Path(args.log_dir))
+    result = validate(Path(args.metrics), Path(args.log_dir), args.harness)
 
     if args.report:
         Path(args.report).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
-    print(
-        f"[evidence] OK: accuracy {result['accuracy']} backed by "
-        f"{result['sample_count']} samples in {Path(result['log']).name}",
-        flush=True,
-    )
+    if result["harness"] == "inspect":
+        print(
+            f"[evidence] OK: accuracy {result['accuracy']} backed by "
+            f"{result['sample_count']} samples in {Path(result['log']).name}",
+            flush=True,
+        )
+    else:
+        graded = result["sample_count"]
+        detail = f"{graded} graded examples" if graded else "a completed grading run"
+        print(
+            f"[evidence] OK: accuracy {result['accuracy']} from {detail} "
+            "(custom harness; no inspect log to cross-check against)",
+            flush=True,
+        )
     return 0
 
 

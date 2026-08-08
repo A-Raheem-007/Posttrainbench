@@ -696,9 +696,19 @@ if [ -s "$LOGS_DIR/metrics.json" ]; then
     # log to be a complete, unsubsetted run.
     echo ""
     echo "=== Validating evaluation evidence ==="
+    # Which evidence rules apply. Five benchmarks run through inspect_ai and
+    # leave a log to cross-check metrics.json against; healthbench and
+    # arenahardwriting run their own grader loop and leave none, so demanding
+    # a log rejects every honest run of those two (eval_151149). Read from
+    # metadata.json, which is baked in at generation time and covered by the
+    # tamper manifest, rather than guessed from the filesystem.
+    EVAL_HARNESS=$(python3 -c "import json;print(json.load(open('$TESTS/metadata.json')).get('eval_harness','inspect'))" 2>/dev/null || echo "inspect")
+    echo "Evidence rules: $EVAL_HARNESS harness"
+
     if python3 "$TESTS/validate_eval_evidence.py" \
             --metrics "$LOGS_DIR/metrics.json" \
             --log-dir "$INSPECT_LOG_DIR" \
+            --harness "$EVAL_HARNESS" \
             --report "$LOGS_DIR/eval_evidence.json" 2>&1 | tee "$LOGS_DIR/eval_evidence.txt"; then
         EVIDENCE_OK=1
     else

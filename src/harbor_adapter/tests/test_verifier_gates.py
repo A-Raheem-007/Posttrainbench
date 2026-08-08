@@ -226,6 +226,51 @@ check("out-of-range accuracy rejected",
       lambda: evid.validate(out_of_range, good_logs),
       want_error_fragment="out of range")
 
+# --- custom-harness benchmarks (healthbench / arenahardwriting) ---
+# Regression: these run their own grader loop and produce NO inspect log, so
+# the inspect rules rejected every honest run (eval_151149 zeroed a complete
+# healthbench result with 245 graded examples).
+no_logs = tmp / "no_logs_at_all"
+
+hb = tmp / "m_healthbench.json"
+hb.write_text(json.dumps({
+    "accuracy": 0.18729470596511, "stderr": 0.01836779380453516,
+    "n_examples": 245, "total_grader_calls": 1873,
+    "by_theme": {"hedging": 0.302}, "by_axis": {"accuracy": 0.249},
+}))
+check("real healthbench result accepted (custom harness)",
+      lambda: evid.validate(hb, no_logs, "custom"))
+
+ahw = tmp / "m_arena.json"
+ahw.write_text(json.dumps({"accuracy": 0.42, "stderr": 0.03}))
+check("real arenahardwriting result accepted (custom harness)",
+      lambda: evid.validate(ahw, no_logs, "custom"))
+
+# ...but the custom path must not accept anything at all.
+accuracy_only = tmp / "m_acc_only.json"
+accuracy_only.write_text(json.dumps({"accuracy": 0.42}))
+check("custom harness still needs stderr",
+      lambda: evid.validate(accuracy_only, no_logs, "custom"),
+      want_error_fragment="no numeric stderr")
+
+empty_run = tmp / "m_empty.json"
+empty_run.write_text(json.dumps({"accuracy": 0.0, "stderr": 0.0}))
+check("empty/failed custom run rejected",
+      lambda: evid.validate(empty_run, no_logs, "custom"),
+      want_error_fragment="not a completed evaluation")
+
+zero_graded = tmp / "m_zero.json"
+zero_graded.write_text(json.dumps({"accuracy": 0.5, "stderr": 0.1, "n_examples": 0}))
+check("custom run grading zero examples rejected",
+      lambda: evid.validate(zero_graded, no_logs, "custom"),
+      want_error_fragment="0 graded examples")
+
+# And an inspect benchmark must NOT get the lenient path just because its log
+# is missing -- the harness comes from metadata, not from the filesystem.
+check("inspect benchmark with no log still rejected",
+      lambda: evid.validate(good_metrics, no_logs, "inspect"),
+      want_error_fragment="does not exist")
+
 print()
 ok = True
 for label, passed in results:
