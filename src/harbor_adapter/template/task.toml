@@ -115,6 +115,13 @@ timeout_sec = 3600.0
 # when CODEX_API_KEY is empty.
 OPENAI_API_KEY = "${OPENAI_API_KEY:-}"
 CODEX_API_KEY = "${OPENAI_API_KEY:-}"
+# Judge endpoint. Empty by default, which makes test.sh use the plain
+# https://api.openai.com/v1. Set this on the host only for a regionally
+# provisioned key. eval_150839 lost every judge attempt to a hardcoded
+# regional host returning "incorrect regional hostname"; the ":-" guard is
+# required because resolve_env_vars() hard-fails on a bare ${VAR} that the
+# host environment does not define.
+CODEX_BASE_URL = "${CODEX_BASE_URL:-}"
 # NOTE: deliberately NOT passing CODEX_JUDGE_MODEL through here. Turness's
 # resolve_env_vars() strictly requires every ${VAR} referenced in
 # [verifier.env] to exist in the HOST environment invoking the trial, or it

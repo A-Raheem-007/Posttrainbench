@@ -451,12 +451,34 @@ if [ -f "$TESTS/contamination_judge.py" ] && [ -n "$BENCHMARK_NAME" ]; then
         # does not work on the codex CLI versions tested here (matches
         # github.com/openai/codex#16719); a custom-named model_provider with
         # an explicit base_url is respected correctly instead.
-        CODEX_REGION="${CODEX_REGION:-us}"
+        # Base URL resolution, in priority order.
+        #
+        # This used to default to a REGIONAL host (us.api.openai.com), which
+        # made every judge attempt fail in eval_150839 with
+        #   HTTP 401: Attempted to access resource with incorrect regional
+        #   hostname. Please make your request to api.openai.com
+        # Both retry attempts burned on a misconfiguration the retry could
+        # never fix. A regional host works only for keys provisioned against
+        # that region, so it cannot be the default -- the plain host is what
+        # an ordinary key expects.
+        #
+        # CODEX_BASE_URL wins if set (thread it through [verifier.env] with a
+        # ${VAR:-} guard). CODEX_REGION is kept as an opt-IN for regional
+        # deployments; it no longer applies unless explicitly set.
+        if [ -n "${CODEX_BASE_URL:-}" ]; then
+            JUDGE_BASE_URL="$CODEX_BASE_URL"
+        elif [ -n "${CODEX_REGION:-}" ]; then
+            JUDGE_BASE_URL="https://${CODEX_REGION}.api.openai.com/v1"
+        else
+            JUDGE_BASE_URL="https://api.openai.com/v1"
+        fi
+        echo "Judge endpoint: $JUDGE_BASE_URL"
+
         mkdir -p "$HOME/.codex"
         cat > "$HOME/.codex/config.toml" <<EOF
 [model_providers.region_openai]
 name = "region_openai"
-base_url = "https://${CODEX_REGION}.api.openai.com/v1"
+base_url = "${JUDGE_BASE_URL}"
 env_key = "CODEX_API_KEY"
 wire_api = "responses"
 EOF
@@ -780,7 +802,7 @@ fi
 # holds the same value as reward.txt; the rest are diagnosis.
 python3 - "$LOGS_DIR/reward.json" "$REWARD" \
     "$EVAL_SUCCEEDED" "$EVIDENCE_OK" "$IDENTITY_OK" "$TAMPER_DETECTED" \
-    "$JUDGES_OK" "$JUDGES_UNAVAILABLE" <<'PY'
+    "$JUDGES_OK" "$JUDGES_UNAVAILABLE" "$AUDIT_OK" <<'PY'
 import json
 import sys
 
