@@ -132,6 +132,28 @@ not_gemma.mkdir()
 check("unrelated family still -> violation",
       lambda: ident.check(not_gemma, GEMMA_IDENTITY), want_status="violation")
 
+# Regression: the real gemma-3-4b-pt config declares model_type "gemma3" at
+# the top level and "gemma3_text" inside text_config. Flattening must NOT let
+# the nested value win, or an unmodified checkpoint describes itself as the
+# text-only variant and the fingerprint stops meaning what it says.
+real_gemma_config = {
+    "architectures": ["Gemma3ForConditionalGeneration"],
+    "model_type": "gemma3",
+    "text_config": {
+        "model_type": "gemma3_text",
+        "hidden_size": 2560,
+        "intermediate_size": 10240,
+        "num_hidden_layers": 34,
+    },
+}
+flat = ident.flatten_config(real_gemma_config)
+check("nested text_config does not hijack model_type",
+      lambda: {"status": flat["model_type"]}, want_status="gemma3")
+check("nested text_config does not hijack architectures",
+      lambda: {"status": flat["architectures"][0]}, want_status="Gemma3ForConditionalGeneration")
+check("nested dimensions are still lifted",
+      lambda: {"status": str(flat["num_hidden_layers"])}, want_status="34")
+
 # And the equivalence must not let the prohibited instruct model through.
 gemma_instruct = tmp / "gemma_instruct"
 gemma_instruct.mkdir()

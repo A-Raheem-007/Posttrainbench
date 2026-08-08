@@ -84,12 +84,32 @@ def sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+#: Fields that identify WHICH checkpoint this is, as opposed to its shape.
+#: Never taken from text_config -- see flatten_config.
+_IDENTITY_ONLY = frozenset({"model_type", "architectures"})
+
+
 def flatten_config(config: dict) -> dict:
-    """gemma-3 nests the language-model fields under text_config."""
+    """Lift gemma-3's nested text_config dimensions to the top level.
+
+    Mirrors adapter._fetch_model_identity exactly, and must keep mirroring it:
+    the two have to describe a model the same way or the comparison is
+    meaningless.
+
+    Identity fields are deliberately NOT overridden by text_config. gemma-3
+    declares model_type "gemma3" at the top level and "gemma3_text" inside
+    text_config, so a blanket update would make an unmodified checkpoint
+    describe itself as the text-only variant -- which is precisely the
+    distinction this file exists to reason about. Only fields absent at the
+    top level are filled in from text_config.
+    """
     flat = dict(config)
     nested = config.get("text_config")
     if isinstance(nested, dict):
-        flat.update(nested)
+        for key, value in nested.items():
+            if key in _IDENTITY_ONLY:
+                continue
+            flat.setdefault(key, value)
     return flat
 
 

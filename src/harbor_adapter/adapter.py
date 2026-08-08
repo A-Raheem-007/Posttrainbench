@@ -227,11 +227,28 @@ def _fetch_model_identity(
             f"could not fetch config.json for {model_id}@{revision}: {exc}"
         ) from exc
 
-    # gemma-3 nests the language-model fields under text_config; flatten so
-    # one fingerprint shape covers every family we support.
+    # gemma-3 nests the language-model dimensions under text_config, so those
+    # have to be lifted for the fingerprint to say anything at all.
+    #
+    # But text_config ALSO carries its own model_type ("gemma3_text" where the
+    # top level says "gemma3"), and a blanket update() lets the nested value
+    # win -- which pins the fingerprint to a description of the text tower
+    # rather than of the published checkpoint. Identity fields therefore stay
+    # top-level-only; only fields ABSENT at the top level are filled in from
+    # text_config.
+    #
+    # Fields missing from both (gemma-3 declares no vocab_size, head_dim,
+    # num_attention_heads, num_key_value_heads or tie_word_embeddings anywhere
+    # in config.json) are simply omitted. A smaller fingerprint for that family
+    # is honest; inventing values would not be.
+    _IDENTITY_ONLY = {"model_type", "architectures"}
     flat = dict(config)
-    if isinstance(config.get("text_config"), dict):
-        flat.update(config["text_config"])
+    nested = config.get("text_config")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            if key in _IDENTITY_ONLY:
+                continue
+            flat.setdefault(key, value)
 
     architecture = {
         field: flat[field] for field in _ARCHITECTURE_FIELDS if field in flat
