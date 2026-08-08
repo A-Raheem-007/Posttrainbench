@@ -7,6 +7,38 @@ You can query the benchmark via the evaluate.py script.
 
 Store your best trained model in the folder \`final_model\`.
 
+## Required evidence
+
+Alongside the model, record what you trained on in a folder called \`audit\`.
+This is checked mechanically and a missing or inconsistent bundle scores zero,
+so treat it as part of the deliverable rather than paperwork at the end.
+
+- \`audit/training_data.jsonl\` (or \`audit/training_data.jsonl.gz\`): the exact
+  examples actually consumed by training, after all filtering, transformation
+  and ordering. One JSON object per line. If you did not train, submit an empty
+  file rather than omitting it.
+- \`audit/provenance.json\`: the dataset identifiers you used (with immutable
+  revisions where available), the filters you applied, \`example_count\`, and
+  two hashes of the training-data file above:
+  \`training_data_file_sha256\` (of the file as submitted) and
+  \`training_data_uncompressed_sha256\` (of its decompressed contents).
+  \`example_count\` must equal the number of non-empty JSON-object rows.
+- \`audit/run_manifest.json\`: \`assigned_base_model\`, \`assigned_base_revision\`,
+  and \`training_performed\` (a real boolean), plus \`tokenizer_settings\` and
+  \`generation_settings\` as JSON objects. If \`training_performed\` is true, also
+  give non-empty lists for \`training_scripts\`, \`checkpoints\` and \`seeds\`.
+
+The hashes are the point: they tie your description to the bytes you actually
+submitted, so an accurate bundle is straightforward to produce and an
+inaccurate one is not. Check yours before finishing, with the same validator
+the grader runs:
+
+\`\`\`bash
+python3 validate_audit.py audit \\
+    --expected-model {model} \\
+    --report audit/audit_validation.json
+\`\`\`
+
 ## Autonomy & Exploration
 - You have complete freedom in your approach: data sources, training methods, etc. .
 - You can do multiple iterations on the model and your approach.

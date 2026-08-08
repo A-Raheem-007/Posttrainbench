@@ -95,6 +95,11 @@ def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> 
         "fetch_model.py",
         "model_identity_check.py",
         "validate_eval_evidence.py",
+        "contamination_check.py",
+        "validate_audit.py",
+        # test_data.json is deliberately NOT hashed: it is optional, so a task
+        # generated without it would carry a manifest entry for a file that
+        # does not exist and fail the tamper gate on every run.
     ):
         candidate = tests_dir / name
         if candidate.is_file():
@@ -667,6 +672,16 @@ fi
             env_dir / "publish_model.py",
         )
 
+        # validate_audit.py goes to BOTH sides, from one source file so the
+        # two copies cannot drift. The agent preflights its bundle with the
+        # same validator the verifier re-runs, so "it passed locally" means
+        # something. (The colleague's task ships two copies that have already
+        # gone out of sync -- three files hash differently between them.)
+        shutil.copy(
+            TEMPLATE_DIR / "tests" / "validate_audit.py",
+            env_dir / "validate_audit.py",
+        )
+
         # timer.sh — agent reads it during the run. Verifier doesn't need it.
         self.generate_timer_sh(env_dir)
 
@@ -784,6 +799,12 @@ fi
             "benchmark_name": benchmark_info.benchmark_name,
             "model_id": model_info.model_id,
             "model_short_name": model_info.short_name,
+            # The pinned upstream commit of the assigned base model. Both
+            # copies get it: the agent needs it to fill run_manifest.json, and
+            # the verifier needs it to check that declaration. Only the
+            # revision string is shared -- the weight hashes stay
+            # verifier-only (see the model_identity block below).
+            "model_revision": self._model_identity(model_info)["assigned_revision"],
             "num_hours": self.num_hours,
         }
         # NOTE: the HF token is deliberately NOT written here any more.
@@ -951,10 +972,27 @@ fi
             "fetch_model.py",
             "model_identity_check.py",
             "validate_eval_evidence.py",
+            # Judge tool, not a gate: the contamination prompt tells the judge
+            # to run it in difficult cases. Vendored from upstream.
+            "contamination_check.py",
+            "validate_audit.py",
         ):
             destination = tests_dir / name
             shutil.copy(TEMPLATE_DIR / "tests" / name, destination)
             destination.chmod(0o755)
+
+        # Reference test items for contamination_check.py, if the operator has
+        # provisioned them (harbor_adapter/tools/download_test_data.py writes
+        # them here). Optional by design: when absent the judge just cannot run
+        # the n-gram tool and falls back to reading the trace, which is how
+        # every run worked before this existed.
+        #
+        # tests/ ONLY. Copying the benchmark's test items into environment/
+        # would hand the agent the exact data this is meant to detect.
+        test_data_src = Path(__file__).parent / "test_data" / f"{benchmark_id}.json"
+        if test_data_src.is_file():
+            shutil.copy(test_data_src, tests_dir / "test_data.json")
+            print(f"  Included contamination reference data for {benchmark_id}")
 
         # Eval pipeline (also baked into the agent workspace via
         # environment/, but the verifier reads from /tests/ where these

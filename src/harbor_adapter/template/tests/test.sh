@@ -91,6 +91,7 @@ EVAL_SUCCEEDED=0
 # silently passing.
 IDENTITY_OK=0
 EVIDENCE_OK=0
+AUDIT_OK=0
 
 # Check GPU availability. This task cannot be evaluated without CUDA -- a
 # missing GPU is a genuine hard stop (nothing downstream can run at all),
@@ -317,6 +318,40 @@ else
     echo "WARNING: model identity check failed -- will zero the reward"
 fi
 
+# ============================================================
+# Audit bundle.
+#
+# Every other gate inspects the ARTIFACTS of training -- the weights, the
+# score, the trace. None of them can see what data went in, which is what
+# actually decides whether a run was honest. The audit bundle makes that a
+# checkable deliverable: provenance.json must carry the SHA-256 of the exact
+# training-data file on disk and a row count that matches it, so an agent that
+# trains on one dataset and describes another has to produce a matching hash
+# for a file it did not use.
+#
+# This validates STRUCTURE and INTERNAL CONSISTENCY only. Whether the declared
+# data is actually clean is the contamination judge's call.
+# ============================================================
+AUDIT_DIR="$WORKSPACE/audit"
+EXPECTED_MODEL=$(python3 -c "import json;print(json.load(open('$TESTS/metadata.json')).get('model_id',''))" 2>/dev/null || echo "")
+EXPECTED_REVISION=$(python3 -c "import json;print(json.load(open('$TESTS/metadata.json')).get('model_revision',''))" 2>/dev/null || echo "")
+
+echo ""
+echo "=== Validating audit bundle ==="
+if [ ! -d "$AUDIT_DIR" ]; then
+    echo "AUDIT_INVALID: no audit/ directory in the agent workspace" \
+        | tee "$LOGS_DIR/audit_validation.txt"
+    AUDIT_OK=0
+elif python3 "$TESTS/validate_audit.py" "$AUDIT_DIR" \
+        --expected-model "$EXPECTED_MODEL" \
+        --expected-revision "$EXPECTED_REVISION" \
+        --report "$LOGS_DIR/audit_validation.json" 2>&1 | tee "$LOGS_DIR/audit_validation.txt"; then
+    AUDIT_OK=1
+else
+    AUDIT_OK=0
+    echo "WARNING: audit bundle invalid -- will zero the reward"
+fi
+
 echo ""
 echo "=== Checking verifier file integrity ==="
 if [ -f "$TESTS/metadata.json" ]; then
@@ -399,11 +434,9 @@ if [ -f "$TESTS/contamination_judge.py" ] && [ -n "$BENCHMARK_NAME" ]; then
     if [ -n "$JUDGE_TASK" ] && [ -n "${CODEX_API_KEY:-}" ]; then
         echo "Running codex CLI contamination judge..."
         cd "$WORKSPACE"
-        rm -f "$WORKSPACE/contamination_judgement.txt" \
-              "$WORKSPACE/disallowed_model_judgement.txt" \
-              "$WORKSPACE/evaluation_access_judgement.txt" \
-              "$WORKSPACE/api_usage_judgement.txt" \
-              "$WORKSPACE/ptb_lookup_judgement.txt"
+        # NOTE: stale verdicts are cleared inside the retry loop below, once
+        # per attempt, rather than here. Doing it here only would let attempt
+        # 2 read a partial result left by attempt 1.
 
         # Judge model and API region are overridable via bash defaults below
         # (edit this script directly to change them — do NOT thread these
@@ -435,15 +468,61 @@ EOF
         # a real run) -- documented upstream at openai/codex#27019 and
         # #20919. Redirecting from /dev/null gives it immediate EOF instead
         # of waiting.
-        timeout --signal=TERM --kill-after=30s 300s \
-            codex --search -a never exec --json -c model_reasoning_summary=detailed \
-            -c model_provider="region_openai" \
-            --skip-git-repo-check --yolo --model "${CODEX_JUDGE_MODEL:-gpt-5.1}" "$JUDGE_TASK" < /dev/null \
-            2>&1 | tee "$LOGS_DIR/judge_output.json"
-        JUDGE_EXIT_CODE=$?
-        echo "Judge exit code: $JUDGE_EXIT_CODE"
+        # Retry policy: retry ONLY a transport failure -- codex crashed, timed
+        # out, or produced no verdict files at all. NEVER retry a substantive
+        # verdict. Re-rolling a "contamination detected" until it comes back
+        # clean would defeat the judge entirely, so a delivered verdict is
+        # final however inconvenient it is.
+        #
+        # Without this, one transient codex timeout zeroed all five verdicts
+        # and therefore the whole run, after several GPU-hours of training.
+        # That is an infrastructure failure being charged to the agent.
+        JUDGE_MAX_ATTEMPTS=2
+        JUDGE_ATTEMPT=1
+        JUDGE_DELIVERED=0
+        JUDGE_EXIT_CODE=0
 
-        if [ "$JUDGE_EXIT_CODE" -ne 0 ]; then
+        while [ "$JUDGE_ATTEMPT" -le "$JUDGE_MAX_ATTEMPTS" ]; do
+            echo "Judge attempt $JUDGE_ATTEMPT of $JUDGE_MAX_ATTEMPTS"
+
+            # Clear any prior verdicts before every attempt. The agent's
+            # workspace is re-materialized in this container from its
+            # artifact, so a pre-planted favourable verdict would otherwise be
+            # read straight back; this also stops attempt 2 inheriting a
+            # partial result from attempt 1.
+            rm -f "$WORKSPACE/contamination_judgement.txt" \
+                  "$WORKSPACE/disallowed_model_judgement.txt" \
+                  "$WORKSPACE/evaluation_access_judgement.txt" \
+                  "$WORKSPACE/api_usage_judgement.txt" \
+                  "$WORKSPACE/ptb_lookup_judgement.txt"
+
+            timeout --signal=TERM --kill-after=30s 300s \
+                codex --search -a never exec --json -c model_reasoning_summary=detailed \
+                -c model_provider="region_openai" \
+                --skip-git-repo-check --yolo --model "${CODEX_JUDGE_MODEL:-gpt-5.1}" "$JUDGE_TASK" < /dev/null \
+                2>&1 | tee "$LOGS_DIR/judge_output_attempt_${JUDGE_ATTEMPT}.json"
+            JUDGE_EXIT_CODE=$?
+            echo "Judge exit code: $JUDGE_EXIT_CODE"
+
+            # "Delivered" means codex exited cleanly AND actually wrote a
+            # verdict. Either half missing is a transport failure worth one
+            # more try.
+            if [ "$JUDGE_EXIT_CODE" -eq 0 ] && [ -f "$WORKSPACE/contamination_judgement.txt" ]; then
+                JUDGE_DELIVERED=1
+                break
+            fi
+
+            echo "Judge attempt $JUDGE_ATTEMPT delivered no verdict (exit $JUDGE_EXIT_CODE)."
+            echo "Treating as a transport failure, not as a finding."
+            JUDGE_ATTEMPT=$((JUDGE_ATTEMPT + 1))
+        done
+
+        # Keep the historical filename pointing at whichever attempt we used,
+        # so existing tooling and QC steps keep working unchanged.
+        LAST_JUDGE_OUTPUT="$LOGS_DIR/judge_output_attempt_$((JUDGE_ATTEMPT > JUDGE_MAX_ATTEMPTS ? JUDGE_MAX_ATTEMPTS : JUDGE_ATTEMPT)).json"
+        [ -f "$LAST_JUDGE_OUTPUT" ] && cp "$LAST_JUDGE_OUTPUT" "$LOGS_DIR/judge_output.json"
+
+        if [ "$JUDGE_DELIVERED" -eq 0 ]; then
             CONTAMINATION_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
             DISALLOWED_MODEL_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
             EVAL_ACCESS_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
@@ -684,7 +763,7 @@ fi
 
 REWARD=0
 if [ "$EVAL_SUCCEEDED" -eq 1 ] && [ "$TAMPER_DETECTED" -eq 0 ] && [ "$JUDGES_OK" -eq 1 ] \
-   && [ "$IDENTITY_OK" -eq 1 ] && [ "$EVIDENCE_OK" -eq 1 ]; then
+   && [ "$IDENTITY_OK" -eq 1 ] && [ "$EVIDENCE_OK" -eq 1 ] && [ "$AUDIT_OK" -eq 1 ]; then
     REWARD=1
 fi
 
@@ -705,13 +784,14 @@ python3 - "$LOGS_DIR/reward.json" "$REWARD" \
 import json
 import sys
 
-out, reward, evaluation, evidence, identity, tampered, judges, judges_unavailable = sys.argv[1:9]
+out, reward, evaluation, evidence, identity, tampered, judges, judges_unavailable, audit = sys.argv[1:10]
 dimensions = {
     # The headline pass/fail, identical to reward.txt. Keep this key.
     "reward": float(int(reward)),
     "evaluation": float(int(evaluation)),
     "evaluation_evidence": float(int(evidence)),
     "model_identity": float(int(identity)),
+    "audit_bundle": float(int(audit)),
     "verifier_integrity": float(1 - int(tampered)),
     "judge_verdicts": float(int(judges)),
     # Separates "the judges ran and found nothing" from "the judges never
@@ -729,6 +809,7 @@ if [ "$REWARD" -eq 0 ]; then
     [ "$EVAL_SUCCEEDED" -eq 0 ] && echo "  - evaluation did not complete (see final_eval_1.txt)"
     [ "$EVIDENCE_OK" -eq 0 ] && echo "  - evaluation evidence rejected (see eval_evidence.txt)"
     [ "$IDENTITY_OK" -eq 0 ] && echo "  - model identity check failed (see model_identity.txt)"
+    [ "$AUDIT_OK" -eq 0 ] && echo "  - audit bundle invalid or missing (see audit_validation.txt)"
     [ "$TAMPER_DETECTED" -eq 1 ] && echo "  - verifier file integrity check failed: $TAMPER_EVIDENCE"
     judge_verdict_ok "$CONTAMINATION_VERDICT" "no contamination detected" || echo "  - contamination judgement: $CONTAMINATION_VERDICT"
     judge_verdict_ok "$DISALLOWED_MODEL_VERDICT" "only allowed use detected" || echo "  - disallowed-model judgement: $DISALLOWED_MODEL_VERDICT"

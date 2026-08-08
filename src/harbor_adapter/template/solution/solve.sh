@@ -144,3 +144,79 @@ if [[ ! -f final_model/config.json ]] || \
     exit 1
 fi
 echo "[solve] OK: valid final_model/ produced (baseline oracle)"
+
+# ---------------------------------------------------------------------------
+# Audit bundle.
+#
+# The verifier requires every submission to declare what it trained on, with
+# hashes that pin the declaration to the bytes actually submitted. The oracle
+# trains on nothing, so it declares exactly that: an empty training-data file,
+# example_count 0, training_performed false.
+#
+# This is not ceremony. If the oracle did not emit a bundle it would fail the
+# audit gate, and we would have a verifier that rejects its own reference
+# submission -- which is the clearest possible sign a gate is mis-specified.
+# Emitting it here means the oracle exercises the same contract real agents do.
+# ---------------------------------------------------------------------------
+mkdir -p audit
+
+python3 - <<'PY'
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+
+audit = Path("audit")
+data_path = audit / "training_data.jsonl.gz"
+
+# mtime=0 so the bytes are identical across runs. Without it gzip stamps the
+# current time into the header and the file hash changes every run, which
+# makes "did the oracle produce the same bundle as last time" unanswerable.
+raw = b""
+with gzip.GzipFile(filename="", mode="wb", fileobj=data_path.open("wb"), mtime=0) as handle:
+    handle.write(raw)
+
+file_bytes = data_path.read_bytes()
+
+(audit / "provenance.json").write_text(json.dumps({
+    "kind": "oracle_no_training",
+    "datasets": [],
+    "filters": [],
+    "ordering": "n/a",
+    "example_count": 0,
+    "training_data_file_sha256": hashlib.sha256(file_bytes).hexdigest(),
+    "training_data_uncompressed_sha256": hashlib.sha256(raw).hexdigest(),
+}, indent=2, sort_keys=True) + "\n")
+
+# Read the assignment from metadata.json, the same source the rest of this
+# script uses, rather than from the environment -- one source of truth.
+meta = json.loads(Path("metadata.json").read_text())
+
+(audit / "run_manifest.json").write_text(json.dumps({
+    "assigned_base_model": meta.get("model_id", ""),
+    "assigned_base_revision": meta.get("model_revision", ""),
+    "training_performed": False,
+    "oracle_baseline": True,
+    "training_scripts": [],
+    "checkpoints": [],
+    "seeds": [],
+    "tokenizer_settings": {},
+    "generation_settings": {},
+}, indent=2, sort_keys=True) + "\n")
+
+print("[solve] wrote audit bundle (no-training baseline)")
+PY
+
+# Preflight with the verifier's own validator, so a contract change breaks the
+# oracle here rather than silently zeroing every real submission later.
+MODEL_REVISION=$(python3 -c "import json; print(json.load(open('metadata.json')).get('model_revision',''))")
+if [[ -f validate_audit.py ]]; then
+    python3 validate_audit.py audit \
+        --expected-model "$MODEL_ID" \
+        --expected-revision "$MODEL_REVISION" \
+        --report audit/audit_validation.json \
+        || { echo "[solve] ERROR: oracle produced an invalid audit bundle" >&2; exit 1; }
+else
+    echo "[solve] NOTE: validate_audit.py not present; skipping audit preflight"
+fi
