@@ -89,7 +89,13 @@ def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> 
     # fetch_model.py is verifier-owned and security-relevant (it is what
     # re-checks the transferred model's SHA-256 manifest), so it belongs in the
     # tamper manifest alongside evaluate.py and the judge.
-    for name in ("evaluate.py", "contamination_judge.py", "fetch_model.py"):
+    for name in (
+        "evaluate.py",
+        "contamination_judge.py",
+        "fetch_model.py",
+        "model_identity_check.py",
+        "validate_eval_evidence.py",
+    ):
         candidate = tests_dir / name
         if candidate.is_file():
             candidate_paths.append(candidate)
@@ -109,6 +115,133 @@ def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> 
         relpath = path.relative_to(tests_dir).as_posix()
         checksums[relpath] = hashlib.sha256(path.read_bytes()).hexdigest()
     return checksums
+
+
+# config.json fields that together pin a model's architecture. Chosen because
+# they are stable across revisions of the same checkpoint but differ between
+# model families and sizes, so a mismatch means "this is not the assigned
+# model" rather than "the upstream repo was touched".
+_ARCHITECTURE_FIELDS = (
+    "model_type",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "vocab_size",
+    "head_dim",
+    "tie_word_embeddings",
+)
+
+
+def _hf_api_json(url: str, token: str | None) -> dict:
+    """GET a Hugging Face API endpoint. Stdlib only, no huggingface_hub."""
+    import urllib.request
+
+    headers = {"User-Agent": "posttrainbench-adapter"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
+
+
+def _weight_hashes(repo_info: dict) -> dict[str, str]:
+    """Map weight filename -> sha256, from a ?blobs=true model_info payload.
+
+    Only weight files are hashed. Tokenizer and config files are identical
+    between a base model and its instruct sibling often enough that including
+    them would blur exactly the distinction we need to draw.
+    """
+    hashes: dict[str, str] = {}
+    for sibling in repo_info.get("siblings", []):
+        name = sibling.get("rfilename", "")
+        if not name.endswith((".safetensors", ".bin")):
+            continue
+        lfs = sibling.get("lfs") or {}
+        digest = lfs.get("sha256") or lfs.get("oid")
+        if digest:
+            hashes[name] = digest
+    return hashes
+
+
+def _fetch_model_identity(
+    model_id: str, instruct_model_id: str, token: str | None
+) -> dict:
+    """Pin the assigned model's identity, for verifier-side checking.
+
+    Returns the assigned revision, its architecture fingerprint, the exact
+    sha256 of its weight files, and the sha256 of the PROHIBITED instruct
+    sibling's weights.
+
+    Fetched at generation time rather than hardcoded. A hand-maintained table
+    of hashes for 4 models x 2 checkpoints goes stale the moment an upstream
+    repo is re-uploaded, and a stale hash is worse than none: it fails honest
+    submissions. This costs one API call per model and is always current.
+
+    Raises on failure rather than degrading: a task generated without this
+    data cannot detect an instruct-model substitution, and silently shipping
+    a weaker verifier is not a trade worth making automatically.
+    """
+    base_url = f"https://huggingface.co/api/models/{model_id}?blobs=true"
+    instruct_url = f"https://huggingface.co/api/models/{instruct_model_id}?blobs=true"
+
+    try:
+        base_info = _hf_api_json(base_url, token)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"could not fetch model identity for {model_id}: {exc}. "
+            "Generation needs network access to the Hugging Face API to pin "
+            "the assigned revision and weight hashes."
+        ) from exc
+
+    try:
+        instruct_info = _hf_api_json(instruct_url, token)
+        instruct_hashes = _weight_hashes(instruct_info)
+    except Exception as exc:  # noqa: BLE001
+        # A missing instruct sibling is survivable: the identity gate simply
+        # cannot run its denylist arm. Say so loudly instead of pretending.
+        print(
+            f"  WARNING: could not fetch {instruct_model_id} ({exc}). The "
+            "identity gate will not be able to reject a verbatim instruct-"
+            "model submission for this task."
+        )
+        instruct_hashes = {}
+
+    revision = base_info.get("sha")
+    if not revision:
+        raise RuntimeError(f"Hugging Face returned no revision sha for {model_id}")
+
+    # config.json is small and not LFS, so fetch it from the pinned revision
+    # directly rather than through the API listing.
+    config_url = f"https://huggingface.co/{model_id}/resolve/{revision}/config.json"
+    try:
+        config = _hf_api_json(config_url, token)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"could not fetch config.json for {model_id}@{revision}: {exc}"
+        ) from exc
+
+    # gemma-3 nests the language-model fields under text_config; flatten so
+    # one fingerprint shape covers every family we support.
+    flat = dict(config)
+    if isinstance(config.get("text_config"), dict):
+        flat.update(config["text_config"])
+
+    architecture = {
+        field: flat[field] for field in _ARCHITECTURE_FIELDS if field in flat
+    }
+    architectures = config.get("architectures") or flat.get("architectures") or []
+
+    return {
+        "assigned_model_id": model_id,
+        "assigned_revision": revision,
+        "architectures": architectures,
+        "architecture": architecture,
+        "base_weight_sha256": sorted(_weight_hashes(base_info).values()),
+        "prohibited_model_id": instruct_model_id,
+        "prohibited_weight_sha256": sorted(instruct_hashes.values()),
+    }
 
 
 # PostTrainBench source directory (relative to repo root)
@@ -131,6 +264,14 @@ class BenchmarkInfo:
 class ModelInfo:
     model_id: str          # HuggingFace model ID, e.g., "Qwen/Qwen3-1.7B-Base"
     short_name: str        # Short name for task IDs, e.g., "qwen3-1.7b"
+    # The instruction-tuned sibling of model_id. Submitting THIS instead of a
+    # model actually trained from the base is the highest-value cheat
+    # available, and it is invisible to an architecture fingerprint because
+    # the base and instruct checkpoints are architecturally identical (same
+    # hidden_size, layers, heads, vocab -- only the weights differ). The
+    # verifier therefore needs its exact weight hashes to reject it, which is
+    # why _fetch_model_identity() looks this up.
+    instruct_model_id: str
 
 
 BENCHMARKS = {
@@ -182,19 +323,25 @@ BENCHMARKS = {
 MODELS = {
     "qwen3-1.7b": ModelInfo(
         model_id="Qwen/Qwen3-1.7B-Base",
-        short_name="qwen3-1.7b"
+        short_name="qwen3-1.7b",
+        instruct_model_id="Qwen/Qwen3-1.7B",
     ),
     "qwen3-4b": ModelInfo(
         model_id="Qwen/Qwen3-4B-Base",
-        short_name="qwen3-4b"
+        short_name="qwen3-4b",
+        instruct_model_id="Qwen/Qwen3-4B",
     ),
     "smollm3-3b": ModelInfo(
         model_id="HuggingFaceTB/SmolLM3-3B-Base",
-        short_name="smollm3-3b"
+        short_name="smollm3-3b",
+        instruct_model_id="HuggingFaceTB/SmolLM3-3B",
     ),
     "gemma3-4b": ModelInfo(
         model_id="google/gemma-3-4b-pt",
-        short_name="gemma3-4b"
+        short_name="gemma3-4b",
+        # gemma-3's instruction-tuned sibling uses the "-it" suffix rather
+        # than dropping a "-Base" suffix like the Qwen/SmolLM families.
+        instruct_model_id="google/gemma-3-4b-it",
     ),
 }
 
@@ -253,6 +400,10 @@ class PostTrainBenchAdapter:
         self.include_claude_clause = include_claude_clause
         self.hf_token = hf_token
         self.openai_api_key = openai_api_key
+        # model_id -> identity dict. Generating all 28 tasks touches only 4
+        # distinct models, so without this we would make the same API calls
+        # seven times over.
+        self._model_identity_cache: dict[str, dict] = {}
         self.posttrainbench_root = POSTTRAINBENCH_ROOT
 
     def _read_benchmark_name(self, benchmark_id: str) -> str:
@@ -690,10 +841,35 @@ fi
         # for every text file. Normalizing here first (idempotent, safe to
         # run again later) guarantees the hash matches what test.sh will
         # actually see.
+        # Model identity, for the verifier's model_identity_check.py. Only
+        # written into the VERIFIER's copy (include_checksums is the
+        # tests/-only flag): the agent has no legitimate use for it, and the
+        # prohibited-weight hashes are precisely the values an agent would
+        # need in order to perturb an instruct checkpoint just enough to slip
+        # past the denylist. His task publishes these to the agent workspace;
+        # we deliberately do not.
+        if include_checksums:
+            metadata["model_identity"] = self._model_identity(model_info)
         if include_checksums:
             _normalize_line_endings(target_dir)
             metadata["tests_checksums"] = _compute_tests_checksums(target_dir, task_context_names)
         (target_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    def _model_identity(self, model_info: "ModelInfo") -> dict:
+        """Cached per-model identity lookup (one API round trip per model)."""
+        key = model_info.model_id
+        if key not in self._model_identity_cache:
+            print(f"  Pinning identity for {key} ...")
+            self._model_identity_cache[key] = _fetch_model_identity(
+                model_info.model_id, model_info.instruct_model_id, self.hf_token
+            )
+            identity = self._model_identity_cache[key]
+            print(
+                f"    revision {identity['assigned_revision'][:12]}, "
+                f"{len(identity['base_weight_sha256'])} base weight file(s), "
+                f"{len(identity['prohibited_weight_sha256'])} prohibited"
+            )
+        return self._model_identity_cache[key]
 
     def generate_solution(self, task_dir: Path) -> None:
         """Generate the solution/ directory with the oracle solve.sh.
@@ -762,13 +938,23 @@ fi
         # Build-context support files (same set the agent env needs).
         self._copy_build_context_support(tests_dir)
 
-        # fetch_model.py — the verifier side of the HF relay. Copied BEFORE
-        # _copy_eval_files so it exists when _compute_tests_checksums runs at
-        # the end of that call and therefore lands in the tamper manifest.
-        fetch_src = TEMPLATE_DIR / "tests" / "fetch_model.py"
-        fetch_dst = tests_dir / "fetch_model.py"
-        shutil.copy(fetch_src, fetch_dst)
-        fetch_dst.chmod(0o755)
+        # Verifier-owned gates. Copied BEFORE _copy_eval_files so they exist
+        # when _compute_tests_checksums runs at the end of that call and
+        # therefore land in the tamper manifest.
+        #   fetch_model.py             — verifier side of the HF relay
+        #   model_identity_check.py    — architecture + weight-hash identity
+        #   validate_eval_evidence.py  — accuracy must match the raw inspect log
+        # These live only in tests/, never in the agent's workspace: the agent
+        # has no legitimate use for them, and shipping them would hand it a
+        # readable specification of exactly what it needs to defeat.
+        for name in (
+            "fetch_model.py",
+            "model_identity_check.py",
+            "validate_eval_evidence.py",
+        ):
+            destination = tests_dir / name
+            shutil.copy(TEMPLATE_DIR / "tests" / name, destination)
+            destination.chmod(0o755)
 
         # Eval pipeline (also baked into the agent workspace via
         # environment/, but the verifier reads from /tests/ where these

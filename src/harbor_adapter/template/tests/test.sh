@@ -56,6 +56,17 @@ write_default_reward_if_missing() {
 }
 trap write_default_reward_if_missing EXIT
 
+# Belt to the trap's braces: write a failing reward BEFORE any check runs.
+# A trap only fires on a normal shell exit, so it does nothing if the verifier
+# is SIGKILLed (OOM, container teardown, platform timeout). Pre-writing means
+# the only way a run reports success is for the code at the bottom of this
+# script to actually be reached and overwrite these.
+#
+# Both files: Harbor prefers reward.json when it exists, so leaving only
+# reward.txt here would let a stale reward.json from anywhere else win.
+echo "0" > "$LOGS_DIR/reward.txt"
+printf '{"reward": 0.0}\n' > "$LOGS_DIR/reward.json"
+
 echo "=== PostTrainBench Verifier ==="
 echo "Tests dir: $TESTS"
 echo "Workspace: $WORKSPACE"
@@ -75,6 +86,11 @@ EVAL_ACCESS_VERDICT="judge unavailable (not yet run)"
 API_USAGE_VERDICT="judge unavailable (not yet run)"
 PTB_LOOKUP_VERDICT="judge unavailable (not yet run)"
 EVAL_SUCCEEDED=0
+# Mechanical gates (as opposed to the LLM judges above). Both default to 0 so
+# that any path which fails to run them leaves the reward zeroed rather than
+# silently passing.
+IDENTITY_OK=0
+EVIDENCE_OK=0
 
 # Check GPU availability. This task cannot be evaluated without CUDA -- a
 # missing GPU is a genuine hard stop (nothing downstream can run at all),
@@ -275,6 +291,32 @@ fi
 # script -- evaluation still runs below so metrics.json gets real numbers
 # for forensic purposes -- but a mismatch here zeroes the final reward.
 # ============================================================
+# ============================================================
+# Model identity.
+#
+# The one thing an architecture check cannot do on its own is distinguish the
+# assigned base model from its instruction-tuned sibling -- they are
+# architecturally identical, so only the weight hashes tell them apart.
+# Submitting the instruct checkpoint is the highest-value cheat available
+# here, so this gate hashes the weights and compares against values pinned
+# from the Hugging Face API at task-generation time.
+#
+# Non-halting, like the tamper and judge checks: evaluation still runs so
+# metrics.json carries a real number for forensics, but a violation zeroes
+# the reward.
+# ============================================================
+echo ""
+echo "=== Checking model identity ==="
+if python3 "$TESTS/model_identity_check.py" \
+        --model-dir "$MODEL_DIR" \
+        --metadata "$TESTS/metadata.json" \
+        --report "$LOGS_DIR/model_identity.json" 2>&1 | tee "$LOGS_DIR/model_identity.txt"; then
+    IDENTITY_OK=1
+else
+    IDENTITY_OK=0
+    echo "WARNING: model identity check failed -- will zero the reward"
+fi
+
 echo ""
 echo "=== Checking verifier file integrity ==="
 if [ -f "$TESTS/metadata.json" ]; then
@@ -512,6 +554,15 @@ rm -f "$LOGS_DIR/metrics.json"
 kill_gpu_processes
 echo "Evaluation attempt 1 of 1 (hard limit: ${EVAL_TIMEOUT_SEC}s)"
 
+# Pin inspect_ai's log location so validate_eval_evidence.py knows exactly
+# where to look, and so this attempt's log cannot be confused with any other.
+# Cleared first: the evidence gate requires EXACTLY ONE successful log, and a
+# leftover from an earlier run would fail an otherwise good attempt.
+INSPECT_LOG_DIR="$LOGS_DIR/inspect_logs_attempt_1"
+rm -rf "$INSPECT_LOG_DIR"
+mkdir -p "$INSPECT_LOG_DIR"
+export INSPECT_LOG_DIR
+
 timeout --signal=TERM --kill-after=60s "${EVAL_TIMEOUT_SEC}s" \
     python3 "$TESTS/evaluate.py" \
         --model-path "$MODEL_DIR" \
@@ -523,6 +574,22 @@ EVAL_EXIT_CODE=$?
 
 if [ -s "$LOGS_DIR/metrics.json" ]; then
     EVAL_SUCCEEDED=1
+
+    # metrics.json alone is not evidence: nothing downstream re-derives the
+    # score, so a fabricated or --limit-ed result would be taken at face
+    # value. Require it to agree with inspect's own raw log, and require that
+    # log to be a complete, unsubsetted run.
+    echo ""
+    echo "=== Validating evaluation evidence ==="
+    if python3 "$TESTS/validate_eval_evidence.py" \
+            --metrics "$LOGS_DIR/metrics.json" \
+            --log-dir "$INSPECT_LOG_DIR" \
+            --report "$LOGS_DIR/eval_evidence.json" 2>&1 | tee "$LOGS_DIR/eval_evidence.txt"; then
+        EVIDENCE_OK=1
+    else
+        EVIDENCE_OK=0
+        echo "WARNING: evaluation evidence rejected -- will zero the reward"
+    fi
 else
     if [ "$EVAL_EXIT_CODE" -eq 124 ] || [ "$EVAL_EXIT_CODE" -eq 137 ]; then
         EVAL_ERROR="evaluation exceeded ${EVAL_TIMEOUT_SEC}s hard limit"
@@ -616,14 +683,52 @@ else
 fi
 
 REWARD=0
-if [ "$EVAL_SUCCEEDED" -eq 1 ] && [ "$TAMPER_DETECTED" -eq 0 ] && [ "$JUDGES_OK" -eq 1 ]; then
+if [ "$EVAL_SUCCEEDED" -eq 1 ] && [ "$TAMPER_DETECTED" -eq 0 ] && [ "$JUDGES_OK" -eq 1 ] \
+   && [ "$IDENTITY_OK" -eq 1 ] && [ "$EVIDENCE_OK" -eq 1 ]; then
     REWARD=1
 fi
+
+# Graded companion to the binary reward, so a run that trained well but
+# tripped one gate is distinguishable from a run that produced nothing,
+# without anyone having to read the logs.
+#
+# CRITICAL: Harbor PREFERS reward.json over reward.txt when both exist
+# (verifier.py: `if reward_json_path.exists(): ... elif reward_text_path`),
+# and reward.txt parses to exactly one key named "reward". So the binary
+# signal must be carried INSIDE this file -- emitting only the diagnostic
+# dimensions would silently delete the pass/fail number the platform and any
+# downstream tooling currently read. "reward" is therefore written first and
+# holds the same value as reward.txt; the rest are diagnosis.
+python3 - "$LOGS_DIR/reward.json" "$REWARD" \
+    "$EVAL_SUCCEEDED" "$EVIDENCE_OK" "$IDENTITY_OK" "$TAMPER_DETECTED" \
+    "$JUDGES_OK" "$JUDGES_UNAVAILABLE" <<'PY'
+import json
+import sys
+
+out, reward, evaluation, evidence, identity, tampered, judges, judges_unavailable = sys.argv[1:9]
+dimensions = {
+    # The headline pass/fail, identical to reward.txt. Keep this key.
+    "reward": float(int(reward)),
+    "evaluation": float(int(evaluation)),
+    "evaluation_evidence": float(int(evidence)),
+    "model_identity": float(int(identity)),
+    "verifier_integrity": float(1 - int(tampered)),
+    "judge_verdicts": float(int(judges)),
+    # Separates "the judges ran and found nothing" from "the judges never
+    # ran". Without this, an infrastructure failure and a genuine finding look
+    # identical in the reward signal.
+    "judge_runtime": float(1 - int(judges_unavailable)),
+}
+with open(out, "w") as handle:
+    json.dump(dimensions, handle, indent=2, sort_keys=True)
+PY
 
 if [ "$REWARD" -eq 0 ]; then
     echo "Reward forced to 0. Reasons:"
     [ "$JUDGES_UNAVAILABLE" -eq 1 ] && echo "  - integrity judges did not run; an unverified run cannot pass (fail-closed)"
     [ "$EVAL_SUCCEEDED" -eq 0 ] && echo "  - evaluation did not complete (see final_eval_1.txt)"
+    [ "$EVIDENCE_OK" -eq 0 ] && echo "  - evaluation evidence rejected (see eval_evidence.txt)"
+    [ "$IDENTITY_OK" -eq 0 ] && echo "  - model identity check failed (see model_identity.txt)"
     [ "$TAMPER_DETECTED" -eq 1 ] && echo "  - verifier file integrity check failed: $TAMPER_EVIDENCE"
     judge_verdict_ok "$CONTAMINATION_VERDICT" "no contamination detected" || echo "  - contamination judgement: $CONTAMINATION_VERDICT"
     judge_verdict_ok "$DISALLOWED_MODEL_VERDICT" "only allowed use detected" || echo "  - disallowed-model judgement: $DISALLOWED_MODEL_VERDICT"
