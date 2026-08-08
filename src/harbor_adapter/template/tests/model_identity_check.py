@@ -35,6 +35,42 @@ from pathlib import Path
 
 WEIGHT_SUFFIXES = (".safetensors", ".bin")
 
+# Multimodal -> text-only sibling variants.
+#
+# Agents legitimately discard the vision tower of a multimodal base model and
+# save final_model as its text-only sibling, purely as a training-efficiency
+# measure for a text-only benchmark. The weights are still derived from the
+# assigned model, so this is NOT a substitution -- but the extracted config
+# reports a different model_type and architecture, so a naive equality check
+# rejects an honest submission.
+#
+# Upstream hit exactly this and fixed it the same way (aisa-group/
+# PostTrainBench, new_judge_v2, commit 491bcff: "model_identity_check treats
+# gemma3 and gemma3_text as equivalent so text-only conversions of Gemma-3
+# aren't mis-flagged as substituted models"). Their contamination prompt
+# gained a matching clause telling the judge not to flag disallowed_model on
+# this basis either.
+#
+# Add further sets here if the same pattern appears for other multimodal
+# families. Note this deliberately does NOT weaken the base-vs-instruct
+# check, which is decided by weight hashes rather than config fields.
+MODEL_TYPE_EQUIVALENCES = (
+    frozenset({"gemma3", "gemma3_text"}),
+)
+
+ARCHITECTURE_EQUIVALENCES = (
+    frozenset({"Gemma3ForConditionalGeneration", "Gemma3ForCausalLM"}),
+)
+
+
+def _equivalent(value, expected, equivalences) -> bool:
+    if value == expected:
+        return True
+    for group in equivalences:
+        if value in group and expected in group:
+            return True
+    return False
+
 
 class IdentityError(RuntimeError):
     pass
@@ -73,15 +109,27 @@ def check(model_dir: Path, identity: dict) -> dict:
         )
     for field, expected_value in sorted(expected_arch.items()):
         actual = flat.get(field)
-        if actual != expected_value:
+        if field == "model_type":
+            if not _equivalent(actual, expected_value, MODEL_TYPE_EQUIVALENCES):
+                issues.append(f"{field}={actual!r} (expected {expected_value!r})")
+        elif actual != expected_value:
             issues.append(f"{field}={actual!r} (expected {expected_value!r})")
 
     expected_architectures = identity.get("architectures") or []
     actual_architectures = flat.get("architectures") or []
-    if expected_architectures and not set(expected_architectures) & set(actual_architectures):
-        issues.append(
-            f"architectures={actual_architectures!r} (expected one of {expected_architectures!r})"
-        )
+    if expected_architectures and actual_architectures:
+        matched = set(expected_architectures) & set(actual_architectures)
+        if not matched:
+            matched = any(
+                _equivalent(actual, expected, ARCHITECTURE_EQUIVALENCES)
+                for actual in actual_architectures
+                for expected in expected_architectures
+            )
+        if not matched:
+            issues.append(
+                f"architectures={actual_architectures!r} "
+                f"(expected one of {expected_architectures!r})"
+            )
 
     weights = sorted(
         path

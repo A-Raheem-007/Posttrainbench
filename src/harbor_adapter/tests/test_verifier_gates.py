@@ -89,6 +89,60 @@ check("missing fingerprint fails closed",
       lambda: ident.check(trained_dir, {**IDENTITY, "architecture": {}}),
       want_error_fragment="no architecture fingerprint")
 
+# Regression: Gemma-3 text-only extraction must NOT be flagged.
+# Agents legitimately drop the vision tower of a multimodal base model for a
+# text-only benchmark, which changes model_type gemma3 -> gemma3_text and
+# architectures Gemma3ForConditionalGeneration -> Gemma3ForCausalLM. Upstream
+# hit this and fixed it in new_judge_v2 (491bcff); an exact-equality check
+# rejects an honest submission.
+GEMMA_ARCH = {
+    "model_type": "gemma3", "hidden_size": 2560, "intermediate_size": 10240,
+    "num_hidden_layers": 34, "num_attention_heads": 8, "num_key_value_heads": 4,
+    "vocab_size": 262208, "head_dim": 256, "tie_word_embeddings": True,
+}
+GEMMA_IDENTITY = {
+    "assigned_model_id": "google/gemma-3-4b-pt",
+    "assigned_revision": "abc123",
+    "architectures": ["Gemma3ForConditionalGeneration"],
+    "architecture": GEMMA_ARCH,
+    "base_weight_sha256": [hashlib.sha256(base_bytes).hexdigest()],
+    "prohibited_model_id": "google/gemma-3-4b-it",
+    "prohibited_weight_sha256": [hashlib.sha256(instruct_bytes).hexdigest()],
+}
+
+gemma_text = tmp / "gemma_text"
+gemma_text.mkdir()
+(gemma_text / "config.json").write_text(json.dumps({
+    **GEMMA_ARCH,
+    "model_type": "gemma3_text",
+    "architectures": ["Gemma3ForCausalLM"],
+}))
+(gemma_text / "model.safetensors").write_bytes(trained_bytes)
+check("gemma3 text-only extraction -> derived (not flagged)",
+      lambda: ident.check(gemma_text, GEMMA_IDENTITY), want_status="derived")
+
+# ...but a genuinely different family must still be rejected, so the
+# equivalence above is not a blanket escape hatch.
+not_gemma = tmp / "not_gemma"
+not_gemma.mkdir()
+(not_gemma / "config.json").write_text(json.dumps({
+    **GEMMA_ARCH, "model_type": "llama", "architectures": ["LlamaForCausalLM"],
+}))
+(not_gemma / "model.safetensors").write_bytes(trained_bytes)
+check("unrelated family still -> violation",
+      lambda: ident.check(not_gemma, GEMMA_IDENTITY), want_status="violation")
+
+# And the equivalence must not let the prohibited instruct model through.
+gemma_instruct = tmp / "gemma_instruct"
+gemma_instruct.mkdir()
+(gemma_instruct / "config.json").write_text(json.dumps({
+    **GEMMA_ARCH, "model_type": "gemma3_text",
+    "architectures": ["Gemma3ForCausalLM"],
+}))
+(gemma_instruct / "model.safetensors").write_bytes(instruct_bytes)
+check("prohibited weights still caught despite text-only config",
+      lambda: ident.check(gemma_instruct, GEMMA_IDENTITY), want_status="violation")
+
 # --- evidence gate ---
 def write_log(d, *, status="success", limit=None, accuracy=0.42, samples=100):
     d.mkdir(parents=True, exist_ok=True)
