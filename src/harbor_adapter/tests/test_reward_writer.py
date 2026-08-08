@@ -1,16 +1,23 @@
 """Run the REAL reward.json writer extracted from test.sh.
 
 WHY THIS EXISTS
-A previous version of this test exercised a hand-copied version of the
-snippet. It passed while the shipped code was broken: an edit added a
-parameter to the unpack line but not to the argument list, so the real block
-died with "not enough values to unpack (expected 9, got 8)" on a live run and
-left reward.json at its pre-written {"reward": 0.0}. bash -n cannot catch an
-argument-count mismatch, and a copy of the code cannot catch a divergence
+An earlier version of this test exercised a hand-copied version of the
+snippet. It passed while the shipped code was broken: an edit added a value to
+the Python unpack line but not to the shell argument list, so the real block
+died with "not enough values to unpack (expected 9, got 8)" on a live run
+(eval_150839) and left reward.json at its pre-written {"reward": 0.0}.
+bash -n cannot catch that, and a copy of the code cannot catch a divergence
 from the code.
 
-So this parses the block out of test.sh itself and executes it. If the
-argument list and the unpack ever disagree again, this fails offline.
+The writer has since moved to named environment variables specifically so that
+class of bug is impossible, but this still parses the block out of test.sh and
+executes it, and now also enforces two invariants:
+
+  1. Every D_* the Python body reads is actually supplied by the shell wrapper
+     (the named-form equivalent of the old arity check).
+  2. Every key that has ever shipped is still emitted, and "reward" is still
+     present -- Harbor prefers reward.json over reward.txt, so silently
+     dropping a key changes what the platform records.
 """
 import json
 import re
@@ -22,64 +29,83 @@ from pathlib import Path
 TEST_SH = Path(__file__).resolve().parent.parent / "template" / "tests" / "test.sh"
 text = TEST_SH.read_text(encoding="utf-8")
 
-# The invocation: `python3 - "$LOGS_DIR/reward.json" ... <<'PY' ... PY`
+# Keys shipped in every generated task to date. Removing one is a breaking
+# change to anything reading reward.json, so it must be a deliberate act, not
+# a side effect.
+BASELINE_KEYS = {
+    "reward", "evaluation", "evaluation_evidence", "model_identity",
+    "audit_bundle", "verifier_integrity", "judge_runtime", "judge_verdicts",
+}
+
+ok = True
+
+
+def check(label, passed, detail=""):
+    global ok
+    print(f"  [{'PASS' if passed else 'FAIL'}] {label}{'  -- ' + detail if detail else ''}")
+    ok = ok and passed
+
+
 match = re.search(
-    r"^python3 - \"\$LOGS_DIR/reward\.json\"(?P<args>.*?)<<'PY'\n(?P<body>.*?)^PY$",
+    r"^write_reward_dimensions\(\) \{\n(?P<wrapper>.*?)"
+    r"    python3 - \"\$LOGS_DIR/reward\.json\" <<'PY'\n(?P<body>.*?)^PY$",
     text, re.MULTILINE | re.DOTALL,
 )
 if not match:
-    print("FAIL: could not locate the reward.json writer in test.sh")
+    print("FAIL: could not locate write_reward_dimensions() in test.sh")
     sys.exit(1)
 
-raw_args = match.group("args")
-body = match.group("body")
+wrapper, body = match.group("wrapper"), match.group("body")
 
-# Shell variables passed, in order, after the output path.
-shell_vars = re.findall(r'"\$([A-Z_]+)"', raw_args)
-print(f"  writer receives {len(shell_vars) + 1} args: reward.json + {shell_vars}")
+supplied = set(re.findall(r"\b(D_[A-Z_]+)=", wrapper))
+consumed = set(re.findall(r'flag\("(D_[A-Z_]+)"\)', body))
+print(f"  wrapper supplies {len(supplied)} vars, body reads {len(consumed)}")
 
-# What the Python body expects.
-unpack = re.search(r"^\s*(.+?)\s*=\s*sys\.argv\[1:(\d+)\]", body, re.MULTILINE)
-if not unpack:
-    print("FAIL: could not find the sys.argv unpack in the writer body")
-    sys.exit(1)
-names = [n.strip() for n in unpack.group(1).split(",")]
-upper = int(unpack.group(2))
-print(f"  writer unpacks {len(names)} names from sys.argv[1:{upper}]")
+missing = consumed - supplied
+check("every variable the body reads is supplied", not missing, str(sorted(missing)))
+unused = supplied - consumed
+check("no variable is supplied but ignored", not unused, str(sorted(unused)))
 
-ok = True
-if len(names) != len(shell_vars) + 1:
-    print(f"  [FAIL] arity mismatch: {len(shell_vars) + 1} args vs {len(names)} names")
-    ok = False
-else:
-    print("  [PASS] argument count matches unpack arity")
-
-if upper != len(names) + 1:
-    print(f"  [FAIL] slice sys.argv[1:{upper}] does not match {len(names)} names")
-    ok = False
-else:
-    print("  [PASS] argv slice matches unpack arity")
-
-# Now actually run it, the way test.sh does.
+# Execute the real body with every flag set to 1.
 tmp = Path(tempfile.mkdtemp())
 out = tmp / "reward.json"
-values = ["1"] * len(shell_vars)
-proc = subprocess.run(
-    [sys.executable, "-", str(out), *values],
-    input=body, capture_output=True, text=True,
-)
+import os
+# D_JUDGE_RUNTIME carries "judges were UNAVAILABLE", so an all-good run sets it
+# to 0. Setting it to 1 alongside everything else would be asserting a
+# contradiction, not a passing run.
+env = {**os.environ, **{name: "1" for name in supplied}, "D_JUDGE_RUNTIME": "0"}
+proc = subprocess.run([sys.executable, "-", str(out)], input=body,
+                      capture_output=True, text=True, env=env)
 if proc.returncode != 0:
-    print(f"  [FAIL] writer raised: {proc.stderr.strip().splitlines()[-1] if proc.stderr else '?'}")
-    ok = False
-else:
-    payload = json.loads(out.read_text())
-    if "reward" not in payload:
-        print("  [FAIL] output has no 'reward' key -- Harbor reads reward.json in preference")
-        print("         to reward.txt, so dropping this key deletes the pass/fail signal")
-        ok = False
-    else:
-        print(f"  [PASS] writer ran; keys = {sorted(payload)}")
+    tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "?"
+    check("writer executes", False, tail)
+    sys.exit(1)
 
+payload = json.loads(out.read_text())
+check("writer executes", True, f"{len(payload)} keys")
+
+missing_baseline = BASELINE_KEYS - set(payload)
+check("every previously-shipped key survives", not missing_baseline,
+      f"missing {sorted(missing_baseline)}" if missing_baseline else "no ripples")
+
+check("reward key present", "reward" in payload)
+check("reward is the first key", next(iter(payload)) == "reward",
+      f"first key is {next(iter(payload))!r}")
+check("all values are floats", all(isinstance(v, float) for v in payload.values()))
+check("all-ones input yields all ones",
+      all(v == 1.0 for v in payload.values()),
+      str({k: v for k, v in payload.items() if v != 1.0}))
+
+# Inverted flag: JUDGES_UNAVAILABLE=1 must mean judge_runtime=0.
+env_zero = {**os.environ, **{name: "0" for name in supplied}, "D_JUDGE_RUNTIME": "1"}
+proc = subprocess.run([sys.executable, "-", str(out)], input=body,
+                      capture_output=True, text=True, env=env_zero)
+payload_zero = json.loads(out.read_text())
+check("judge_runtime inverts D_JUDGE_RUNTIME", payload_zero["judge_runtime"] == 0.0,
+      f"got {payload_zero['judge_runtime']}")
+check("reward stays present when everything fails", "reward" in payload_zero)
+
+print(f"\n  emitted keys ({len(payload)}): {', '.join(payload)}")
 print()
 print("ALL PASS" if ok else "FAILURES PRESENT")
 sys.exit(0 if ok else 1)

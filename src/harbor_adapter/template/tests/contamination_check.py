@@ -9,20 +9,32 @@ Kept byte-identical to upstream so it can be re-synced with a plain copy. If
 this needs changing, change it upstream and re-vendor.
 
 HOW IT IS USED HERE
-This is a TOOL FOR THE JUDGE, not an automatic gate, which is upstream's own
-framing: the contamination prompt tells the judge to run it "in difficult
-cases", and states explicitly that a clean n-gram result does NOT acquit a
-training set whose construction was visibly steered by the benchmark. So a
-clean result here is evidence, not a verdict.
+test.sh runs this as a SCORED GATE (the deterministic_scan reward dimension),
+not only as an aid to the judge. It is the one contamination check that
+measures rather than opines: everything else on this front is a model reading
+a trace and forming a view.
 
-It needs a reference copy of the benchmark's test items. That file is only
-present when the operator has provisioned it (see
-harbor_adapter/tools/download_test_data.py, also vendored from upstream,
-which covers all seven benchmarks). When it is absent the judge simply
-cannot run this tool and falls back to reading the trace -- nothing breaks.
+Pipeline: prepare_scan_input.py flattens the agent's declared training data
+(audit/training_data.jsonl[.gz], hash-bound by the audit contract) into one
+text blob per row, then this scores each row against /tests/test_data.json.
+The flattening step is required, not cosmetic -- see that file's docstring for
+why a chat-format corpus otherwise scans as clean.
+
+Tolerance is applied by test.sh, not here: this exits 1 on ANY overlap, while
+the gate tolerates up to 3 overlapping documents to match the contamination
+judge's stated tolerance. A judge and a gate that disagreed on where the line
+sits would be overruling each other on the same run.
+
+Scoring note, measured on the humaneval reference set: a document containing
+only a test item's QUESTION scores 0, as does one containing only the ANSWER.
+Both together score 1.000. That is deliberate in decon's design -- a prompt
+without its solution teaches nothing -- and it means this detects training
+rows that actually convey a test item, not incidental topic overlap.
 
 The reference data is shipped ONLY into tests/, never into environment/:
 handing the agent the test set would be the very contamination this detects.
+It is mandatory, so generation fails without it, and it is covered by the
+tamper manifest so it cannot be swapped for an empty list.
 
 Requires tiktoken, already pinned in containers/requirements-direct.txt.
 

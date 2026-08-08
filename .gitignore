@@ -258,3 +258,18 @@ posttrainbench-*-*/
 # env-delivery investigation and is reusable if the platform changes.
 !src/harbor_adapter/diagnostics/posttrainbench-diag-tasktoml-env/
 !src/harbor_adapter/diagnostics/posttrainbench-diag-tasktoml-env/**
+
+# Decontamination reference data, provisioned locally by
+# src/harbor_adapter/tools/download_test_data.py.
+#
+# Deliberately NOT committed. Two reasons, the first decisive:
+#   1. Idavidrein/gpqa is a GATED dataset. It is gated precisely to keep the
+#      test items out of scrapeable public locations, and this repository is
+#      public -- committing it would redistribute exactly what the gate exists
+#      to prevent.
+#   2. ~27 MB of benchmark test items that are already obtainable from their
+#      upstream sources, so carrying them in history buys nothing.
+#
+# They ARE shipped into each generated task's tests/ directory (verifier-side
+# only, never environment/), which is where the scan needs them.
+src/eval/tasks/*/test_data.json

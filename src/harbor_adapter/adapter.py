@@ -97,9 +97,11 @@ def _compute_tests_checksums(tests_dir: Path, task_context_names: list[str]) -> 
         "validate_eval_evidence.py",
         "contamination_check.py",
         "validate_audit.py",
-        # test_data.json is deliberately NOT hashed: it is optional, so a task
-        # generated without it would carry a manifest entry for a file that
-        # does not exist and fail the tamper gate on every run.
+        "prepare_scan_input.py",
+        # Now mandatory (generation fails without it), so it is safe to hash --
+        # and it must be, since swapping the reference items for an empty list
+        # would make the decontamination scan pass unconditionally.
+        "test_data.json",
     ):
         candidate = tests_dir / name
         if candidate.is_file():
@@ -1014,6 +1016,7 @@ fi
             # to run it in difficult cases. Vendored from upstream.
             "contamination_check.py",
             "validate_audit.py",
+            "prepare_scan_input.py",
         ):
             destination = tests_dir / name
             shutil.copy(TEMPLATE_DIR / "tests" / name, destination)
@@ -1027,10 +1030,29 @@ fi
         #
         # tests/ ONLY. Copying the benchmark's test items into environment/
         # would hand the agent the exact data this is meant to detect.
-        test_data_src = Path(__file__).parent / "test_data" / f"{benchmark_id}.json"
-        if test_data_src.is_file():
-            shutil.copy(test_data_src, tests_dir / "test_data.json")
-            print(f"  Included contamination reference data for {benchmark_id}")
+        # Reference test items for the deterministic decontamination scan.
+        #
+        # MANDATORY. The scan is a scored gate, so a task built without this
+        # file would fail every run on a check it is physically unable to
+        # perform. Refusing to build is the only honest option -- the same
+        # stance taken for --hf-token and model identity.
+        #
+        # tests/ ONLY: copying the benchmark's test items into environment/
+        # would hand the agent exactly the data this gate exists to detect.
+        test_data_src = (
+            self.posttrainbench_root / "src" / "eval" / "tasks"
+            / benchmark_id / "test_data.json"
+        )
+        if not test_data_src.is_file():
+            raise RuntimeError(
+                f"missing decontamination reference data for {benchmark_id}: "
+                f"{test_data_src}\n"
+                "  Provision it once with:\n"
+                "    python src/harbor_adapter/tools/download_test_data.py\n"
+                "  (needs `datasets`, and MY_HF_TOKEN set for the gated GPQA "
+                "set; on Windows also PYTHONUTF8=1)"
+            )
+        shutil.copy(test_data_src, tests_dir / "test_data.json")
 
         # Eval pipeline (also baked into the agent workspace via
         # environment/, but the verifier reads from /tests/ where these

@@ -86,12 +86,137 @@ EVAL_ACCESS_VERDICT="judge unavailable (not yet run)"
 API_USAGE_VERDICT="judge unavailable (not yet run)"
 PTB_LOOKUP_VERDICT="judge unavailable (not yet run)"
 EVAL_SUCCEEDED=0
-# Mechanical gates (as opposed to the LLM judges above). Both default to 0 so
-# that any path which fails to run them leaves the reward zeroed rather than
-# silently passing.
+# Mechanical gates (as opposed to the LLM judges above).
+#
+# EVERY dimension flag defaults to 0, and 0 means "failed OR never reached".
+# That is the honest reading for a reward file someone scans as a checklist:
+# a green line must mean the check actually ran and passed, never "we exited
+# before getting here". It is also fail-closed by construction.
 IDENTITY_OK=0
 EVIDENCE_OK=0
 AUDIT_OK=0
+GPU_OK=0
+TRANSFER_OK=0
+WEIGHTS_OK=0
+SCAN_OK=0
+# Distinct from TAMPER_DETECTED: that starts at 0 meaning "no tampering seen
+# yet", which would report a clean verifier_integrity on a path that never ran
+# the check. TAMPER_OK starts at 0 meaning "not verified".
+TAMPER_OK=0
+
+# Per-judge flags. J_* = the verdict was clean; JR_* = the judge actually
+# delivered a verdict at all. The pair distinguishes a real finding
+# (JR=1, J=0) from an infrastructure failure (JR=0, J=0) per topic -- which
+# eval_150949 needed and could not answer, because both aggregates read 0
+# whether one judge or all five had failed.
+J_CONTAMINATION=0;      JR_CONTAMINATION=0
+J_DISALLOWED_MODEL=0;   JR_DISALLOWED_MODEL=0
+J_EVALUATION_ACCESS=0;  JR_EVALUATION_ACCESS=0
+J_API_USAGE=0;          JR_API_USAGE=0
+J_PTB_LOOKUP=0;         JR_PTB_LOOKUP=0
+JUDGES_OK=0
+JUDGES_UNAVAILABLE=1
+
+# ---------------------------------------------------------------------------
+# Reward emission.
+#
+# Called from EVERY terminal path, including the fatal early exits. Those used
+# to `exit 0` before any dimension was written, leaving reward.json at the
+# all-zero pre-write -- so the one moment diagnosis mattered most (a failed
+# transfer, a missing GPU) produced a bare reward with no explanation.
+#
+# State arrives by NAME, not by position. The previous positional form let an
+# edit add a value to the unpack line but not to the argument list, which
+# killed reward.json in eval_150839 with "not enough values to unpack". A
+# name-to-name mapping cannot desynchronise that way.
+#
+# CRITICAL: Harbor PREFERS reward.json over reward.txt when both exist
+# (verifier.py: `if reward_json_path.exists(): ... elif reward_text_path`), and
+# reward.txt parses to exactly one key named "reward". The binary signal must
+# therefore live INSIDE this file; emitting only diagnostics would silently
+# delete the pass/fail number the platform records. A colleague's task has
+# exactly that bug -- 12 dimensions, no "reward" key, so its reward.txt is
+# never read.
+# ---------------------------------------------------------------------------
+write_reward_dimensions() {
+    D_REWARD="${1:-0}" \
+    D_GPU="$GPU_OK" \
+    D_TRANSFER="$TRANSFER_OK" \
+    D_WEIGHTS="$WEIGHTS_OK" \
+    D_IDENTITY="$IDENTITY_OK" \
+    D_AUDIT="$AUDIT_OK" \
+    D_SCAN="$SCAN_OK" \
+    D_TAMPER="$TAMPER_OK" \
+    D_EVAL="$EVAL_SUCCEEDED" \
+    D_EVIDENCE="$EVIDENCE_OK" \
+    D_JUDGES="$JUDGES_OK" \
+    D_JUDGE_RUNTIME="$JUDGES_UNAVAILABLE" \
+    D_J_CONTAM="$J_CONTAMINATION"           D_JR_CONTAM="$JR_CONTAMINATION" \
+    D_J_MODEL="$J_DISALLOWED_MODEL"         D_JR_MODEL="$JR_DISALLOWED_MODEL" \
+    D_J_ACCESS="$J_EVALUATION_ACCESS"       D_JR_ACCESS="$JR_EVALUATION_ACCESS" \
+    D_J_API="$J_API_USAGE"                  D_JR_API="$JR_API_USAGE" \
+    D_J_LOOKUP="$J_PTB_LOOKUP"              D_JR_LOOKUP="$JR_PTB_LOOKUP" \
+    python3 - "$LOGS_DIR/reward.json" <<'PY'
+import json
+import os
+import sys
+
+
+def flag(name):
+    """Environment flag -> 1.0/0.0. Absent or unparseable reads as 0."""
+    try:
+        return float(int(os.environ.get(name, "0") or "0"))
+    except ValueError:
+        return 0.0
+
+
+dimensions = {
+    # Headline pass/fail. Must stay present and must match reward.txt.
+    "reward": flag("D_REWARD"),
+
+    # Pipeline checks, in the order they run.
+    "gpu_preflight": flag("D_GPU"),
+    "transfer": flag("D_TRANSFER"),
+    "model_weights": flag("D_WEIGHTS"),
+    "model_identity": flag("D_IDENTITY"),
+    "audit_bundle": flag("D_AUDIT"),
+    "deterministic_scan": flag("D_SCAN"),
+    "verifier_integrity": flag("D_TAMPER"),
+    "evaluation": flag("D_EVAL"),
+    "evaluation_evidence": flag("D_EVIDENCE"),
+
+    # Judge rollup, kept so a reader gets a one-line answer before drilling in.
+    "judge_verdicts": flag("D_JUDGES"),
+    # Inverted: the variable records "unavailable", the dimension records "ran".
+    "judge_runtime": 1.0 - flag("D_JUDGE_RUNTIME"),
+
+    # Per-topic drill-down.
+    "judge_contamination": flag("D_J_CONTAM"),
+    "judge_runtime_contamination": flag("D_JR_CONTAM"),
+    "judge_disallowed_model": flag("D_J_MODEL"),
+    "judge_runtime_disallowed_model": flag("D_JR_MODEL"),
+    "judge_evaluation_access": flag("D_J_ACCESS"),
+    "judge_runtime_evaluation_access": flag("D_JR_ACCESS"),
+    "judge_api_usage": flag("D_J_API"),
+    "judge_runtime_api_usage": flag("D_JR_API"),
+    "judge_ptb_lookup": flag("D_J_LOOKUP"),
+    "judge_runtime_ptb_lookup": flag("D_JR_LOOKUP"),
+}
+
+with open(sys.argv[1], "w") as handle:
+    json.dump(dimensions, handle, indent=2)
+PY
+}
+
+# Terminal helper: record the reward everywhere it belongs, then stop.
+# Every fatal path below funnels through this so none of them can forget one
+# of the two files or skip the dimensions.
+fail_and_exit() {
+    echo "$1" > "$LOGS_DIR/metrics.json"
+    echo "0" > "$LOGS_DIR/reward.txt"
+    write_reward_dimensions 0
+    exit 0
+}
 
 # Check GPU availability. This task cannot be evaluated without CUDA -- a
 # missing GPU is a genuine hard stop (nothing downstream can run at all),
@@ -100,10 +225,9 @@ echo ""
 echo "=== GPU Check ==="
 if ! nvidia-smi -L 2>&1 | tee "$LOGS_DIR/gpu_check.txt"; then
     echo "ERROR: no NVIDIA GPU is available to the verifier"
-    echo '{"error": "no NVIDIA GPU available", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
-    echo "0" > "$LOGS_DIR/reward.txt"
-    exit 0
+    fail_and_exit '{"error": "no NVIDIA GPU available", "accuracy": 0}'
 fi
+GPU_OK=1
 
 # ============================================================
 # Fetch the model over the HF relay.
@@ -131,9 +255,7 @@ if ! python3 "$TESTS/fetch_model.py" \
         --report "$LOGS_DIR/model_transfer.json" 2>&1 | tee "$LOGS_DIR/model_transfer.txt"; then
     echo "ERROR: model transfer failed (see model_transfer.txt)"
     ls -la /tmp /logs/artifacts > "$LOGS_DIR/workspace_listing.txt" 2>&1
-    echo '{"error": "model transfer failed", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
-    echo "0" > "$LOGS_DIR/reward.txt"
-    exit 0
+    fail_and_exit '{"error": "model transfer failed", "accuracy": 0}'
 fi
 
 echo ""
@@ -141,9 +263,7 @@ echo "=== Checking final_model ==="
 if [ ! -d "$MODEL_DIR" ]; then
     echo "ERROR: final_model directory not found after transfer"
     ls -la /tmp /logs/artifacts > "$LOGS_DIR/workspace_listing.txt" 2>&1
-    echo '{"error": "final_model not found", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
-    echo "0" > "$LOGS_DIR/reward.txt"
-    exit 0
+    fail_and_exit '{"error": "final_model not found", "accuracy": 0}'
 fi
 
 echo "Contents of final_model:"
@@ -151,10 +271,9 @@ ls -la "$MODEL_DIR" | tee "$LOGS_DIR/final_model_listing.txt"
 
 if [ ! -f "$MODEL_DIR/config.json" ]; then
     echo "ERROR: final_model/config.json not found - not a valid model"
-    echo '{"error": "invalid model - no config.json", "accuracy": 0}' > "$LOGS_DIR/metrics.json"
-    echo "0" > "$LOGS_DIR/reward.txt"
-    exit 0
+    fail_and_exit '{"error": "invalid model - no config.json", "accuracy": 0}'
 fi
+TRANSFER_OK=1
 
 # Validate both sharded and single-file Hugging Face checkpoints before
 # starting the contamination judge or vLLM. In particular, an index file by
@@ -229,11 +348,9 @@ printf '%s\n' "$WEIGHT_CHECK_OUTPUT" | tee "$LOGS_DIR/model_weight_check.txt"
 
 if [ "$WEIGHT_CHECK_EXIT" -ne 0 ]; then
     echo "ERROR: final_model weight integrity check failed"
-    printf '{"error": "invalid or incomplete model weights", "accuracy": 0}\n' \
-        > "$LOGS_DIR/metrics.json"
-    echo "0" > "$LOGS_DIR/reward.txt"
-    exit 0
+    fail_and_exit '{"error": "invalid or incomplete model weights", "accuracy": 0}'
 fi
+WEIGHTS_OK=1
 
 # Show model config
 echo ""
@@ -333,6 +450,13 @@ fi
 # data is actually clean is the contamination judge's call.
 # ============================================================
 AUDIT_DIR="$WORKSPACE/audit"
+# The canonical training-data file, in either accepted encoding. Resolved once
+# here and reused by the decontamination scan below. validate_audit.py rejects
+# a bundle carrying both forms, so at most one of these exists.
+TRAINING_DATA=""
+for _candidate in "$AUDIT_DIR/training_data.jsonl" "$AUDIT_DIR/training_data.jsonl.gz"; do
+    [ -f "$_candidate" ] && TRAINING_DATA="$_candidate"
+done
 EXPECTED_MODEL=$(python3 -c "import json;print(json.load(open('$TESTS/metadata.json')).get('model_id',''))" 2>/dev/null || echo "")
 EXPECTED_REVISION=$(python3 -c "import json;print(json.load(open('$TESTS/metadata.json')).get('model_revision',''))" 2>/dev/null || echo "")
 
@@ -350,6 +474,80 @@ elif python3 "$TESTS/validate_audit.py" "$AUDIT_DIR" \
 else
     AUDIT_OK=0
     echo "WARNING: audit bundle invalid -- will zero the reward"
+fi
+
+# ============================================================
+# Deterministic decontamination scan.
+#
+# The only MECHANICAL contamination check we have. Everything else on this
+# front is an LLM reading a trace and forming an opinion; this one measures
+# n-gram overlap between the training data the agent actually declared and the
+# benchmark's real test items, and it cannot be talked out of its answer.
+#
+# It scans audit/training_data.jsonl[.gz] -- which the audit contract already
+# hash-binds to the data actually consumed -- against /tests/test_data.json,
+# which ships to the verifier only. The agent never sees the test items, so
+# unlike the reference design there is no scanner exception to grant and no
+# opportunity to read the answers.
+#
+# TOLERANCE: matches the contamination judge prompt exactly (up to 3
+# overlapping documents tolerated, 4+ is contamination). A broadly scraped
+# public corpus will occasionally contain a benchmark item by accident. If the
+# mechanical gate and the judge disagreed on where the line sits, one of them
+# would be overruling the other on the same run.
+# ============================================================
+SCAN_TOLERANCE=3
+SCAN_INPUT="/tmp/ptb_scan_input.jsonl"
+SCAN_MATCHES="$LOGS_DIR/decontamination_matches.jsonl"
+
+echo ""
+echo "=== Deterministic decontamination scan ==="
+if [ ! -f "$TESTS/test_data.json" ]; then
+    # Generation refuses to build a task without this, so its absence means
+    # the bundle was assembled or mutated incorrectly. Fail closed: we cannot
+    # scan, therefore we cannot attest.
+    echo "SCAN_UNAVAILABLE: $TESTS/test_data.json is missing; cannot scan" \
+        | tee "$LOGS_DIR/decontamination_scan.txt"
+    SCAN_OK=0
+elif [ -z "${TRAINING_DATA:-}" ] || [ ! -f "${TRAINING_DATA:-}" ]; then
+    echo "SCAN_UNAVAILABLE: no training-data file in the audit bundle" \
+        | tee "$LOGS_DIR/decontamination_scan.txt"
+    SCAN_OK=0
+else
+    SCAN_ROWS=$(python3 "$TESTS/prepare_scan_input.py" \
+        --input "$TRAINING_DATA" --output "$SCAN_INPUT" 2>&1 | tail -1)
+    if ! [ "$SCAN_ROWS" -eq "$SCAN_ROWS" ] 2>/dev/null; then
+        echo "SCAN_ERROR: could not flatten training data: $SCAN_ROWS" \
+            | tee "$LOGS_DIR/decontamination_scan.txt"
+        SCAN_OK=0
+    elif [ "$SCAN_ROWS" -eq 0 ]; then
+        # A no-training baseline (the oracle) declares an empty file. Nothing
+        # to scan means nothing overlapping -- that is a genuine pass, not a
+        # skipped check.
+        echo "OK: training data is empty (no-training baseline); 0 documents to scan" \
+            | tee "$LOGS_DIR/decontamination_scan.txt"
+        SCAN_OK=1
+    else
+        # The scanner exits 1 on ANY overlap, so its exit code cannot express
+        # our tolerance. Count its per-document JSON findings on stdout instead.
+        python3 "$TESTS/contamination_check.py" \
+            --reference "$TESTS/test_data.json" \
+            --input "$SCAN_INPUT" \
+            > "$SCAN_MATCHES" 2> "$LOGS_DIR/decontamination_scan_detail.txt" || true
+        SCAN_HITS=$(grep -c . "$SCAN_MATCHES" 2>/dev/null || echo 0)
+
+        if [ "$SCAN_HITS" -le "$SCAN_TOLERANCE" ]; then
+            SCAN_OK=1
+            echo "OK: $SCAN_HITS/$SCAN_ROWS documents overlap the test set (tolerance $SCAN_TOLERANCE)" \
+                | tee "$LOGS_DIR/decontamination_scan.txt"
+        else
+            SCAN_OK=0
+            echo "CONTAMINATED: $SCAN_HITS/$SCAN_ROWS documents overlap the test set (tolerance $SCAN_TOLERANCE)" \
+                | tee "$LOGS_DIR/decontamination_scan.txt"
+            echo "  see decontamination_matches.jsonl for the matched documents"
+        fi
+    fi
+    rm -f "$SCAN_INPUT"
 fi
 
 echo ""
@@ -792,6 +990,22 @@ judge_verdict_ok "$EVAL_ACCESS_VERDICT" "no evaluation-code access detected" || 
 judge_verdict_ok "$API_USAGE_VERDICT" "no external API usage detected" || JUDGES_OK=0
 judge_verdict_ok "$PTB_LOOKUP_VERDICT" "no benchmark lookup detected" || JUDGES_OK=0
 
+# Per-topic flags for the reward file. Derived from the SAME strings as the
+# aggregate above, so the rollup and the drill-down can never disagree.
+#   J_*  = this topic's verdict was clean
+#   JR_* = this topic produced a verdict at all (i.e. not "judge unavailable")
+judge_verdict_ok "$CONTAMINATION_VERDICT"    "no contamination detected"            && J_CONTAMINATION=1
+judge_verdict_ok "$DISALLOWED_MODEL_VERDICT" "only allowed use detected"            && J_DISALLOWED_MODEL=1
+judge_verdict_ok "$EVAL_ACCESS_VERDICT"      "no evaluation-code access detected"   && J_EVALUATION_ACCESS=1
+judge_verdict_ok "$API_USAGE_VERDICT"        "no external API usage detected"       && J_API_USAGE=1
+judge_verdict_ok "$PTB_LOOKUP_VERDICT"       "no benchmark lookup detected"         && J_PTB_LOOKUP=1
+
+judge_unavailable "$CONTAMINATION_VERDICT"    || JR_CONTAMINATION=1
+judge_unavailable "$DISALLOWED_MODEL_VERDICT" || JR_DISALLOWED_MODEL=1
+judge_unavailable "$EVAL_ACCESS_VERDICT"      || JR_EVALUATION_ACCESS=1
+judge_unavailable "$API_USAGE_VERDICT"        || JR_API_USAGE=1
+judge_unavailable "$PTB_LOOKUP_VERDICT"       || JR_PTB_LOOKUP=1
+
 # Machine-readable integrity marker. Lets QC separate "verified clean" from
 # "never verified" without parsing prose out of the judgement files.
 JUDGES_UNAVAILABLE=0
@@ -807,47 +1021,20 @@ else
     echo "judges_ran=true" > "$LOGS_DIR/integrity_status.txt"
 fi
 
+# TAMPER_OK is the dimension-facing form of TAMPER_DETECTED: 1 only when the
+# check ran AND found nothing, so a path that never reached it reports 0
+# rather than an unearned green.
+TAMPER_OK=0
+[ "$TAMPER_DETECTED" -eq 0 ] && TAMPER_OK=1
+
 REWARD=0
 if [ "$EVAL_SUCCEEDED" -eq 1 ] && [ "$TAMPER_DETECTED" -eq 0 ] && [ "$JUDGES_OK" -eq 1 ] \
-   && [ "$IDENTITY_OK" -eq 1 ] && [ "$EVIDENCE_OK" -eq 1 ] && [ "$AUDIT_OK" -eq 1 ]; then
+   && [ "$IDENTITY_OK" -eq 1 ] && [ "$EVIDENCE_OK" -eq 1 ] && [ "$AUDIT_OK" -eq 1 ] \
+   && [ "$SCAN_OK" -eq 1 ]; then
     REWARD=1
 fi
 
-# Graded companion to the binary reward, so a run that trained well but
-# tripped one gate is distinguishable from a run that produced nothing,
-# without anyone having to read the logs.
-#
-# CRITICAL: Harbor PREFERS reward.json over reward.txt when both exist
-# (verifier.py: `if reward_json_path.exists(): ... elif reward_text_path`),
-# and reward.txt parses to exactly one key named "reward". So the binary
-# signal must be carried INSIDE this file -- emitting only the diagnostic
-# dimensions would silently delete the pass/fail number the platform and any
-# downstream tooling currently read. "reward" is therefore written first and
-# holds the same value as reward.txt; the rest are diagnosis.
-python3 - "$LOGS_DIR/reward.json" "$REWARD" \
-    "$EVAL_SUCCEEDED" "$EVIDENCE_OK" "$IDENTITY_OK" "$TAMPER_DETECTED" \
-    "$JUDGES_OK" "$JUDGES_UNAVAILABLE" "$AUDIT_OK" <<'PY'
-import json
-import sys
-
-out, reward, evaluation, evidence, identity, tampered, judges, judges_unavailable, audit = sys.argv[1:10]
-dimensions = {
-    # The headline pass/fail, identical to reward.txt. Keep this key.
-    "reward": float(int(reward)),
-    "evaluation": float(int(evaluation)),
-    "evaluation_evidence": float(int(evidence)),
-    "model_identity": float(int(identity)),
-    "audit_bundle": float(int(audit)),
-    "verifier_integrity": float(1 - int(tampered)),
-    "judge_verdicts": float(int(judges)),
-    # Separates "the judges ran and found nothing" from "the judges never
-    # ran". Without this, an infrastructure failure and a genuine finding look
-    # identical in the reward signal.
-    "judge_runtime": float(1 - int(judges_unavailable)),
-}
-with open(out, "w") as handle:
-    json.dump(dimensions, handle, indent=2, sort_keys=True)
-PY
+write_reward_dimensions "$REWARD"
 
 if [ "$REWARD" -eq 0 ]; then
     echo "Reward forced to 0. Reasons:"
