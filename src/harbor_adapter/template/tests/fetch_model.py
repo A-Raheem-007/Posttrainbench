@@ -216,6 +216,8 @@ def main() -> int:
     # rather than silently merging two checkpoints.
     if final_dir.exists():
         raise FetchError(f"refusing to overwrite existing {final_dir}")
+    if (output_root / "audit").exists():
+        raise FetchError(f"refusing to overwrite existing {output_root / 'audit'}")
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
@@ -257,7 +259,10 @@ def main() -> int:
 
     try:
         verify_manifest(staging, pointer)
-        validate_checkpoint(staging)
+        # The checkpoint now lives one level down, under final_model/, since
+        # the repo also carries audit/. Validating the staging root would look
+        # for config.json beside the audit bundle and always fail.
+        validate_checkpoint(staging / "final_model")
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -275,9 +280,35 @@ def main() -> int:
         if name not in manifest_names:
             (staging / name).unlink(missing_ok=True)
 
-    # Rename last, so /logs/artifacts/final_model only ever exists in a fully
-    # verified state. Anything that sees that path can trust it.
-    staging.rename(final_dir)
+    # Split the verified tree into its two destinations. The repo holds
+    # final_model/ and audit/ side by side; the verifier wants them at
+    # <output_root>/final_model and <output_root>/audit.
+    #
+    # Renamed only after verification, so neither path ever exists in a
+    # half-checked state. Anything that sees them can trust them.
+    staged_model = staging / "final_model"
+    staged_audit = staging / "audit"
+    if not staged_model.is_dir():
+        raise FetchError(
+            "the relay repo has no final_model/ directory; it was published by "
+            "an older publish_model.py that uploaded the checkpoint at the repo "
+            "root. Regenerate the task so both sides agree."
+        )
+    staged_model.rename(final_dir)
+
+    # The audit bundle is optional here on purpose: a run that produced no
+    # bundle must fail at the audit GATE, which can explain itself, rather
+    # than dying in the transfer with a confusing message.
+    audit_dir = output_root / "audit"
+    if staged_audit.is_dir():
+        if audit_dir.exists():
+            shutil.rmtree(audit_dir)
+        staged_audit.rename(audit_dir)
+        print(f"[fetch] audit bundle materialized at {audit_dir}", flush=True)
+    else:
+        print("[fetch] NOTE: relay carried no audit bundle", flush=True)
+
+    shutil.rmtree(staging, ignore_errors=True)
 
     if args.report:
         Path(args.report).write_text(

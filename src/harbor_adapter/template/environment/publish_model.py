@@ -76,7 +76,7 @@ def sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def collect_files(model_dir: Path) -> list[Path]:
+def collect_files(model_dir: Path, required: bool = True) -> list[Path]:
     """Every file that will actually be uploaded, in a stable order.
 
     Sorted so the manifest is byte-reproducible across runs, which makes a
@@ -88,7 +88,7 @@ def collect_files(model_dir: Path) -> list[Path]:
         for path in sorted(model_dir.rglob("*"))
         if path.is_file() and not (skip_parts & set(path.relative_to(model_dir).parts))
     ]
-    if not files:
+    if not files and required:
         raise PublishError(f"no files to publish under {model_dir}")
     return files
 
@@ -114,7 +114,8 @@ def validate_checkpoint(model_dir: Path, files: list[Path]) -> None:
         )
 
 
-def build_manifest(model_dir: Path, files: list[Path]) -> tuple[list[dict], int]:
+def build_manifest(model_dir: Path, files: list[Path],
+                   prefix: str = "") -> tuple[list[dict], int]:
     entries = []
     total = 0
     for path in files:
@@ -122,7 +123,8 @@ def build_manifest(model_dir: Path, files: list[Path]) -> tuple[list[dict], int]
         total += size
         entries.append(
             {
-                "name": path.relative_to(model_dir).as_posix(),
+                "name": (f"{prefix}/" if prefix else "")
+                        + path.relative_to(model_dir).as_posix(),
                 "size": size,
                 "sha256": sha256_file(path),
             }
@@ -150,6 +152,13 @@ def resolve_token() -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", default="/home/agent/workspace/final_model")
+    parser.add_argument(
+        "--audit-dir",
+        default="/home/agent/workspace/audit",
+        help="The agent's audit bundle. Rides the relay alongside the model "
+             "because Harbor's workspace artifact SILENTLY DROPS large files "
+             "on the Modal path -- see the note below.",
+    )
     parser.add_argument("--pointer", default="/tmp/fm.pointer.json")
     parser.add_argument(
         "--repo-prefix",
@@ -176,7 +185,50 @@ def main() -> int:
 
     files = collect_files(model_dir)
     validate_checkpoint(model_dir, files)
-    manifest, total_bytes = build_manifest(model_dir, files)
+    manifest, total_bytes = build_manifest(model_dir, files, prefix="final_model")
+
+    # ------------------------------------------------------------------
+    # The audit bundle rides along.
+    #
+    # It used to travel in Harbor's workspace artifact, which does not work:
+    # on the Modal path that transfer SILENTLY DROPS large files while still
+    # reporting "status": "ok". Measured in eval_152202 -- a real agent wrote
+    # 15,000 training rows, our own validator confirmed the bundle twice in
+    # its container, and by verification time training_data.jsonl was gone.
+    # The largest file that survived that transfer was 2,545 bytes. The agent
+    # was then failed on the audit gate for a file our infrastructure lost.
+    #
+    # Every oracle run passed because the oracle's training file is an empty
+    # 20-byte gzip, far below the drop threshold, so the gate was only ever
+    # exercised at a size that could not fail.
+    #
+    # This relay already moves multi-GB checkpoints reliably, so the audit
+    # bundle goes with them. It also means the training data is covered by the
+    # same per-file SHA-256 manifest, which is a real gain: the verifier can
+    # now prove the data it scans is the data the agent submitted.
+    # ------------------------------------------------------------------
+    audit_dir = Path(args.audit_dir).resolve()
+    audit_files: list[Path] = []
+    if audit_dir.is_dir():
+        audit_files = collect_files(audit_dir, required=False)
+        audit_manifest, audit_bytes = build_manifest(
+            audit_dir, audit_files, prefix="audit"
+        )
+        manifest.extend(audit_manifest)
+        total_bytes += audit_bytes
+        print(
+            f"[publish] audit bundle: {len(audit_files)} file(s), "
+            f"{audit_bytes} bytes",
+            flush=True,
+        )
+    else:
+        # Not fatal here: the verifier's audit gate is what judges a missing
+        # bundle, and it can give a far better message than this script can.
+        print(
+            f"[publish] WARNING: no audit bundle at {audit_dir}; the verifier "
+            "will score the audit gate 0",
+            flush=True,
+        )
 
     try:
         namespace = api.whoami()["name"]
@@ -203,8 +255,17 @@ def main() -> int:
             repo_id=repo_id,
             repo_type="model",
             folder_path=str(model_dir),
+            path_in_repo="final_model",
             ignore_patterns=IGNORE_PATTERNS,
         )
+        if audit_files:
+            commit = api.upload_folder(
+                repo_id=repo_id,
+                repo_type="model",
+                folder_path=str(audit_dir),
+                path_in_repo="audit",
+                ignore_patterns=IGNORE_PATTERNS,
+            )
     except Exception as exc:  # noqa: BLE001
         # Do not leave a private repo behind on a failed upload. The verifier
         # will never learn about this repo (no pointer is written), so nothing
@@ -233,6 +294,7 @@ def main() -> int:
         "repo_type": "model",
         "revision": revision,
         "file_count": len(manifest),
+        "audit_file_count": len(audit_files),
         "total_bytes": total_bytes,
         "files": manifest,
     }

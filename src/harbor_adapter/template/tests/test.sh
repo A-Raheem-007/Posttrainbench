@@ -449,7 +449,29 @@ fi
 # This validates STRUCTURE and INTERNAL CONSISTENCY only. Whether the declared
 # data is actually clean is the contamination judge's call.
 # ============================================================
-AUDIT_DIR="$WORKSPACE/audit"
+# Prefer the RELAYED copy of the audit bundle.
+#
+# The workspace artifact cannot be trusted to carry it. On the Modal path that
+# transfer silently drops large files while still reporting success: in
+# eval_152202 a real agent submitted 15,000 training rows, our own validator
+# confirmed the bundle twice inside its container, and by the time the verifier
+# looked, training_data.jsonl was gone. The largest file that survived that
+# transfer was 2,545 bytes. The agent was failed on a gate for a file our own
+# infrastructure lost.
+#
+# Every oracle run passed because the oracle's training file is an empty
+# 20-byte gzip, far under the drop threshold, so the gate was only ever
+# exercised at a size that could not fail.
+#
+# The relay moves multi-GB checkpoints reliably, so the bundle rides with them
+# and arrives hash-verified. The workspace path is kept only as a fallback for
+# tasks generated before this change.
+AUDIT_DIR="/logs/artifacts/audit"
+if [ ! -d "$AUDIT_DIR" ]; then
+    AUDIT_DIR="$WORKSPACE/audit"
+    echo "NOTE: no relayed audit bundle; falling back to the workspace copy," \
+         "which may be incomplete if any file exceeded the transfer limit"
+fi
 # The canonical training-data file, in either accepted encoding. Resolved once
 # here and reused by the decontamination scan below. validate_audit.py rejects
 # a bundle carrying both forms, so at most one of these exists.
