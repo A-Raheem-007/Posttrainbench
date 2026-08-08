@@ -36,6 +36,18 @@ from pathlib import Path
 MIN_WEIGHT_BYTES = 1
 WEIGHT_SUFFIXES = (".safetensors", ".bin")
 
+# Files the Hub creates by itself when a repo is created. They are never part
+# of what publish_model.py uploaded, so they are absent from the manifest, but
+# snapshot_download fetches them anyway -- .gitattributes arrives on every
+# single relay repo. Without this the "unexpected file" check below rejects
+# every transfer.
+#
+# Narrow on purpose: only these exact names, and only when the manifest does
+# NOT list them. If the agent's checkpoint genuinely contains a README.md it
+# will be in the manifest and gets hash-checked like anything else, and any
+# other unlisted file is still a hard failure.
+HF_MANAGED_FILES = frozenset({".gitattributes", "README.md"})
+
 # Mirrors publish_model.py. A model larger than this is not something we are
 # prepared to accept off the network unattended.
 MAX_TOTAL_BYTES = 50 * 1024**3
@@ -121,7 +133,10 @@ def verify_manifest(root: Path, pointer: dict) -> None:
     if missing:
         raise FetchError(f"{len(missing)} file(s) missing after download: {missing[:5]}")
 
-    extra = sorted(actual - set(expected))
+    extra = sorted(
+        name for name in (actual - set(expected))
+        if name not in HF_MANAGED_FILES
+    )
     if extra:
         raise FetchError(f"{len(extra)} unexpected file(s) after download: {extra[:5]}")
 
@@ -252,6 +267,13 @@ def main() -> int:
     # stray .cache confuses anything that walks the directory (including our
     # own weight-integrity gate, which enumerates files).
     shutil.rmtree(staging / ".cache", ignore_errors=True)
+
+    # Same for the Hub's own bookkeeping files, unless the checkpoint actually
+    # declared them. Leaves final_model containing exactly the manifest.
+    manifest_names = {record["name"] for record in pointer["files"]}
+    for name in HF_MANAGED_FILES:
+        if name not in manifest_names:
+            (staging / name).unlink(missing_ok=True)
 
     # Rename last, so /logs/artifacts/final_model only ever exists in a fully
     # verified state. Anything that sees that path can trust it.

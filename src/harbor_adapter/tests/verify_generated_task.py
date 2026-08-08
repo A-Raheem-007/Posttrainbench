@@ -50,7 +50,20 @@ chk("prohibited hashes only in verifier copy",
     bool(md["model_identity"]["prohibited_weight_sha256"]))
 
 print("\n=== line endings ===")
-bad = [str(p.relative_to(G)) for p in G.rglob("*") if p.is_file() and b"\r" in p.read_bytes()]
+# Only TEXT files. A .png or other binary legitimately contains 0x0D bytes,
+# and the adapter's own _normalize_line_endings deliberately skips them, so
+# flagging those is a false positive that hides real CRLF regressions in the
+# noise. Mirrors _TEXT_SUFFIXES / _TEXT_NAMES in adapter.py.
+TEXT_SUFFIXES = {".sh", ".py", ".toml", ".md", ".json", ".jsonl", ".txt",
+                 ".jinja", ".cfg", ".ini", ".yml", ".yaml"}
+TEXT_NAMES = {"Dockerfile", ".dockerignore"}
+bad = [
+    str(p.relative_to(G))
+    for p in G.rglob("*")
+    if p.is_file()
+    and (p.suffix in TEXT_SUFFIXES or p.name in TEXT_NAMES)
+    and b"\r" in p.read_bytes()
+]
 chk(f"no CRLF anywhere ({bad[:3] if bad else 'clean'})", not bad)
 for f in ["tests/test.sh", "solution/solve.sh"]:
     chk(f"{f} shebang is LF", (G / f).read_bytes()[:12] == b"#!/bin/bash\n")

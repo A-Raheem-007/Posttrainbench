@@ -95,6 +95,31 @@ try:
 except fet.FetchError as e:
     results.append(("smuggled extra file detected", "unexpected file" in str(e)))
 
+# Regression: the Hub creates .gitattributes on every repo it makes, so it
+# arrives in the download but is never in the manifest. Rejecting it as an
+# "unexpected file" failed 100% of live transfers -- caught only by running
+# the relay against real HF, not by any offline fixture.
+hubfiles = tmp / "hubfiles"
+shutil.copytree(dl, hubfiles)
+(hubfiles / ".gitattributes").write_text("*.safetensors filter=lfs diff=lfs merge=lfs -text\n")
+(hubfiles / "README.md").write_text("---\nlibrary_name: transformers\n---\n")
+try:
+    fet.verify_manifest(hubfiles, pointer)
+    results.append(("hub-managed .gitattributes/README tolerated", True))
+except Exception as e:
+    results.append((f"hub-managed .gitattributes/README tolerated -- {e}", False))
+
+# ...but tolerating those must not become a general escape hatch.
+sneak = tmp / "sneak"
+shutil.copytree(hubfiles, sneak)
+(sneak / "payload.safetensors").write_bytes(b"z" * 32)
+try:
+    fet.verify_manifest(sneak, pointer)
+    results.append(("extra file still caught alongside hub files", False))
+except fet.FetchError as e:
+    results.append(("extra file still caught alongside hub files",
+                    "unexpected file" in str(e) and "payload.safetensors" in str(e)))
+
 # path traversal in a manifest entry is refused
 eviltp = dict(pointer)
 eviltp["files"] = pointer["files"] + [{"name": "../escape.bin", "size": 1, "sha256": "00"}]
