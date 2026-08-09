@@ -556,9 +556,39 @@ else
             --reference "$TESTS/test_data.json" \
             --input "$SCAN_INPUT" \
             > "$SCAN_MATCHES" 2> "$LOGS_DIR/decontamination_scan_detail.txt" || true
-        SCAN_HITS=$(grep -c . "$SCAN_MATCHES" 2>/dev/null || echo 0)
+        # Count the findings. This looks trivial and is not:
+        #
+        #   SCAN_HITS=$(grep -c . "$f" || echo 0)
+        #
+        # is WRONG on a clean scan. grep -c on an empty file PRINTS "0" and
+        # also EXITS 1 (it matched nothing), so the `|| echo 0` fires as well
+        # and the variable becomes the two-line string "0\n0". The integer
+        # test below then fails outright and falls through to the failure
+        # branch, so a perfectly clean scan is reported as CONTAMINATED.
+        #
+        # That is not hypothetical: it failed eval_153121 (0 of 10,008
+        # documents) and eval_152814/152815 (0 of 5,000 and 0 of 6,000). The
+        # giveaway in the logs is the message splitting across two lines.
+        #
+        # -s guards the empty case so grep is only run on a non-empty file,
+        # where it exits 0 and the count is a single clean integer.
+        if [ -s "$SCAN_MATCHES" ]; then
+            SCAN_HITS=$(grep -c '' "$SCAN_MATCHES")
+        else
+            SCAN_HITS=0
+        fi
 
-        if [ "$SCAN_HITS" -le "$SCAN_TOLERANCE" ]; then
+        # Defence in depth: if SCAN_HITS is ever not a plain integer again,
+        # say so instead of silently taking the failure branch.
+        case "$SCAN_HITS" in
+            ''|*[!0-9]*)
+                echo "SCAN_ERROR: match count is not an integer: '$SCAN_HITS'" \
+                    | tee "$LOGS_DIR/decontamination_scan.txt"
+                SCAN_HITS=-1
+                ;;
+        esac
+
+        if [ "$SCAN_HITS" -ge 0 ] && [ "$SCAN_HITS" -le "$SCAN_TOLERANCE" ]; then
             SCAN_OK=1
             echo "OK: $SCAN_HITS/$SCAN_ROWS documents overlap the test set (tolerance $SCAN_TOLERANCE)" \
                 | tee "$LOGS_DIR/decontamination_scan.txt"
