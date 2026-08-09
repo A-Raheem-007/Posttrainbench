@@ -536,8 +536,18 @@ elif [ -z "${TRAINING_DATA:-}" ] || [ ! -f "${TRAINING_DATA:-}" ]; then
         | tee "$LOGS_DIR/decontamination_scan.txt"
     SCAN_OK=0
 else
+    # stderr goes to a FILE, not into the captured value.
+    #
+    # This used to be `2>&1 | tail -1`, which merges stderr into stdout and
+    # then takes the last line. prepare_scan_input.py prints only the row
+    # count to stdout, but any warning on stderr -- a DeprecationWarning from
+    # a library, anything at all -- would become the last line and the count
+    # would parse as a non-integer, failing the gate on a run that was fine.
+    # Same failure shape as the grep -c bug below: a value that is right
+    # except when something harmless also spoke.
     SCAN_ROWS=$(python3 "$TESTS/prepare_scan_input.py" \
-        --input "$TRAINING_DATA" --output "$SCAN_INPUT" 2>&1 | tail -1)
+        --input "$TRAINING_DATA" --output "$SCAN_INPUT" \
+        2> "$LOGS_DIR/decontamination_prepare.txt" | tail -1)
     if ! [ "$SCAN_ROWS" -eq "$SCAN_ROWS" ] 2>/dev/null; then
         echo "SCAN_ERROR: could not flatten training data: $SCAN_ROWS" \
             | tee "$LOGS_DIR/decontamination_scan.txt"
