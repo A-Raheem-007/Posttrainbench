@@ -101,6 +101,14 @@ def main() -> None:
         log_format='json',
         max_tokens=args.max_tokens,
         max_connections=args.max_connections,
+        # Stop at the chat template's own turn terminator. Reaches vLLM's
+        # sampling params by the same route max_tokens above already takes
+        # (eval(**kwargs) -> GenerateConfigArgs -> GenerateConfig), so this is
+        # not a new mechanism, just a field that was never set.
+        #
+        # Without it the response never terminates cleanly and the tool-call
+        # parser discards the whole thing; see TEMPLATE_STOP_SEQS.
+        stop_seqs=template_stop_seqs(args),
         **other_kwargs,
     )
     
@@ -143,6 +151,38 @@ def model_type(args) -> str:
     if 'smollm' in architecture:
         return 'smollm'
     raise ValueError(architecture)
+
+# Turn terminators used by the chat templates in templates/.
+#
+# These are NOT the base models' eos_token_id. Qwen3-*-Base stops on
+# <|endoftext|> (151643) while qwen3.jinja ends every turn with <|im_end|>
+# (151645), and the same split exists for the other families. Nothing tells
+# vLLM about the template's terminator, so generation runs straight past it.
+#
+# Measured consequence on BFCL (eval_153283, Qwen3-1.7B): the model emitted a
+# correct <tool_call> block, then <|im_end|> as ordinary text, then another
+# block, and another, until max_tokens truncated the last one mid-JSON. 96 of
+# 100 samples ended in truncation. vLLM's hermes parser json.loads() EVERY
+# match, so the one truncated block raised and the parser returned no tool
+# calls at all -- discarding the correct first block with it. The scorer saw
+# "tool calls: None" and marked all 100 incorrect.
+#
+# The model had named the correct function in 100 of 100 samples. The score
+# was 0.0. This maps a correct model onto a zero, so it is a measurement
+# defect, not a capability result.
+TEMPLATE_STOP_SEQS = {
+    "qwen3.jinja": ["<|im_end|>"],
+    "llama3.jinja": ["<|eot_id|>"],
+    "gemma3_tool_calling.jinja": ["<end_of_turn>"],
+    "smollm.jinja": ["<|im_end|>"],
+}
+
+
+def template_stop_seqs(args) -> list[str]:
+    """Stop sequences for the chat template this model will be served with."""
+    template = os.path.basename(template_kwargs(args)["chat_template"])
+    return TEMPLATE_STOP_SEQS.get(template, [])
+
 
 def template_kwargs(args) -> dict:
     model_type_str = model_type(args)
