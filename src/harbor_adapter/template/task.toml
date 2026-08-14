@@ -103,9 +103,19 @@ allow_internet = true
 #
 # `|| true` is deliberately ABSENT: a publish failure must leave no pointer, so
 # the verifier fails closed with a clear message rather than grading nothing.
+# __PTB_TASK_SLUG__ is replaced at generation time with the Harbor task id.
 [[verifier.collect]]
 service = "main"
-command = "bash -c 'set -eu; python3 /home/agent/workspace/publish_model.py --model-dir /home/agent/workspace/final_model --audit-dir /home/agent/workspace/audit --pointer /tmp/fm.pointer.json'"
+command = """bash -c 'set -eu
+python3 /home/agent/workspace/publish_model.py \
+  --model-dir /home/agent/workspace/final_model \
+  --audit-dir /home/agent/workspace/audit \
+  --pointer /tmp/fm.pointer.json \
+  --result /logs/artifacts/relay-publication-result.json \
+  --task-slug __PTB_TASK_SLUG__
+test -s /tmp/fm.pointer.json
+test -s /logs/artifacts/relay-publication-result.json
+'"""
 timeout_sec = 3600.0
 
 [verifier.env]

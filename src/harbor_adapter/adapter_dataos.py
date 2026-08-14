@@ -193,7 +193,13 @@ class PostTrainBenchAdapter:
             return BENCHMARKS[benchmark_id].benchmark_name
         raise FileNotFoundError(f"Benchmark file not found: {bench_file}")
 
-    def generate_task_toml(self, task_dir: Path, benchmark_id: str = "", model_key: str = "") -> None:
+    def generate_task_toml(
+        self,
+        task_dir: Path,
+        benchmark_id: str = "",
+        model_key: str = "",
+        task_id: str = "",
+    ) -> None:
         """Generate task.toml for the Harbor task."""
         # Copy template and adjust timeout based on num_hours
         template_path = TEMPLATE_DIR / "task.toml"
@@ -206,6 +212,27 @@ class PostTrainBenchAdapter:
         content = content.replace(
             "timeout_sec = 36000.0",
             f"timeout_sec = {float(agent_timeout)}"
+        )
+
+        if not task_id:
+            raise RuntimeError("generate_task_toml requires task_id for relay slug binding")
+        if "__PTB_TASK_SLUG__" not in content:
+            raise RuntimeError(
+                "template/task.toml is missing __PTB_TASK_SLUG__ for the collect hook"
+            )
+        content = content.replace("__PTB_TASK_SLUG__", task_id)
+
+        # Verifier fetch_model.py also needs the slug (separate container).
+        marker = 'CODEX_API_KEY = "${OPENAI_API_KEY:-}"'
+        if marker not in content:
+            raise RuntimeError(
+                "template/task.toml no longer contains the expected "
+                "[verifier.env] CODEX_API_KEY anchor for PTB_TASK_SLUG injection"
+            )
+        content = content.replace(
+            marker,
+            marker + f'\nPTB_TASK_SLUG = "{task_id}"',
+            1,
         )
 
         # For arenahardwriting/healthbench, agents need OPENAI_API_KEY
@@ -567,7 +594,7 @@ fi
         print(f"Generating task: {task_id}")
 
         # Generate all components
-        self.generate_task_toml(task_dir, benchmark_id, model_key)
+        self.generate_task_toml(task_dir, benchmark_id, model_key, task_id=task_id)
         self.generate_instruction(task_dir, model_info, benchmark_info, benchmark_id)
         self.generate_environment(task_dir, benchmark_id, model_info, benchmark_info)
         self.generate_tests(task_dir, benchmark_id, model_info, benchmark_info)
