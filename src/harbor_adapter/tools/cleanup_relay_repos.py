@@ -3,15 +3,15 @@
 
 WHY THIS IS NEEDED
 ------------------
-The relay creates a private ptb-transfer-<random> repo in the collect hook and
-the verifier deletes it immediately after downloading. That covers the normal
-path and a failed upload, but NOT the case where the verifier never runs at
-all: an aborted trial, a platform timeout, a cancelled job, or any failure
-between the agent phase ending and the verifier starting. In those runs the
-weights stay in a private repo with nothing left alive that knows its name.
+The relay publishes a private checkpoint for the separate verifier. On the
+legacy path that was ``ptb-transfer-<random>``. The ownership lifecycle uses a
+deterministic ``ptb-relay-<task-slug>`` slot instead.
 
-Observed in practice: a humaneval-smollm3-3b run published 6.17 GB at
-05:07 and left it behind, discovered only by listing the namespace.
+Both naming schemes can leave orphans when the verifier never starts (aborted
+trial, platform timeout, cancelled job). Prefer
+``tools/relay_preflight.py --delete-stale`` for task-scoped ``ptb-relay-*``
+slots (marker-validated). This script remains for listing / age-based cleanup
+of legacy ``ptb-transfer-*`` orphans and for inventory of ``ptb-relay-*``.
 
 WHAT IT WILL NOT DO
 -------------------
@@ -34,7 +34,9 @@ import sys
 import urllib.error
 import urllib.request
 
-PREFIX = "ptb-transfer-"
+LEGACY_PREFIX = "ptb-transfer-"
+OWNED_PREFIX = "ptb-relay-"
+PREFIXES = (LEGACY_PREFIX, OWNED_PREFIX)
 
 
 def api(path: str, token: str, method: str = "GET"):
@@ -71,14 +73,23 @@ def main() -> int:
     who = api("whoami-v2", args.token)
     namespace = who["name"]
     models = api(f"models?author={namespace}&limit=1000", args.token) or []
-    relay = [m for m in models if PREFIX in m.get("id", "")]
+    relay = [
+        m for m in models
+        if any(prefix in m.get("id", "") for prefix in PREFIXES)
+    ]
 
     if not relay:
-        print(f"No {PREFIX}* repos in {namespace}. Nothing to clean up.")
+        print(
+            f"No {'/'.join(PREFIXES)}* repos in {namespace}. Nothing to clean up."
+        )
         return 0
 
     now = dt.datetime.now(dt.timezone.utc)
     print(f"Found {len(relay)} relay repo(s) in {namespace}:\n")
+    print(
+        "NOTE: for deterministic ptb-relay-<task-slug> slots prefer "
+        "relay_preflight.py --delete-stale (ownership-marker validated).\n"
+    )
 
     stale = []
     for model in sorted(relay, key=lambda m: m.get("createdAt") or ""):

@@ -312,12 +312,31 @@ MODEL_DIR="/logs/artifacts/final_model"
 
 echo ""
 echo "=== Fetching model via HF relay ==="
+TASK_SLUG="${PTB_TASK_SLUG:-}"
+if [ -z "$TASK_SLUG" ] && [ -f "$TESTS/metadata.json" ]; then
+    TASK_SLUG=$(python3 -c "import json; print(json.load(open('$TESTS/metadata.json')).get('task_slug') or '')" 2>/dev/null || true)
+fi
+if [ -z "$TASK_SLUG" ]; then
+    # Harbor task directory name is posttrainbench-<benchmark>-<short-model>.
+    TASK_SLUG="${HARBOR_TASK_NAME:-${TASK_NAME:-}}"
+fi
+if [ -z "$TASK_SLUG" ]; then
+    echo "ERROR: cannot resolve task slug for relay fetch"
+    fail_and_exit '{"error": "relay task slug unresolved", "accuracy": 0}'
+fi
 if ! python3 "$TESTS/fetch_model.py" \
         --pointer /tmp/fm.pointer.json \
         --output-root /logs/artifacts \
         --name final_model \
+        --task-slug "$TASK_SLUG" \
         --report "$LOGS_DIR/model_transfer.json" 2>&1 | tee "$LOGS_DIR/model_transfer.txt"; then
     echo "ERROR: model transfer failed (see model_transfer.txt)"
+    if [ -f /logs/artifacts/relay-publication-result.json ]; then
+        echo "--- relay-publication-result.json ---"
+        cat /logs/artifacts/relay-publication-result.json
+        cp -f /logs/artifacts/relay-publication-result.json \
+            "$LOGS_DIR/relay-publication-result.json" 2>/dev/null || true
+    fi
     ls -la /tmp /logs/artifacts > "$LOGS_DIR/workspace_listing.txt" 2>&1
     fail_and_exit '{"error": "model transfer failed", "accuracy": 0}'
 fi
