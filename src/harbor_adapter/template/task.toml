@@ -34,29 +34,30 @@ allow_internet = true
 # The timer now self-initializes on first `timer.sh` call (see generate_timer_sh),
 # so no healthcheck side effect is needed.
 
-# Evaluate final_model in the agent's own container instead of transferring
-# multi-gigabyte model weights into a separate verifier container. Harbor's
-# artifact-transfer path (Modal/Daytona directory copy) was found to silently
-# drop large files during that transfer, which is what previously caused
-# verifier failures where final_model showed up missing or truncated on the
-# verifier side despite training completing successfully. Shared mode removes
-# the transfer entirely: the verifier reads /home/agent/workspace/final_model
-# in place.
+# The verifier runs in its OWN container (see environment_mode = "separate"
+# below) and never reads final_model out of the agent's workspace. The model
+# reaches it through the HF relay configured further down: the agent's
+# checkpoint is published to a temporary private repo, only a small pointer
+# travels through Harbor's artifact path, and the verifier downloads and
+# hash-checks the files itself.
 #
-# This trades away the old separate-container tamper-resistance guarantee
-# (agent and verifier now share one filesystem/user, so nothing stops the
-# agent from editing evaluate.py or the judge). We compensate for that with
-# two software-level detection mechanisms instead of a hard container
-# boundary:
+# That container boundary is the primary protection: the agent cannot reach
+# evaluate.py, the judges, or the reward logic at all. Two software-level checks
+# are kept on top of it as defence in depth, since they cost nothing and catch
+# a tampered or mis-built package as well as a hostile agent:
 #   1. A checksum manifest of every verifier-owned file (evaluate.py,
-#      contamination_judge.py, templates/, evaluation_code/, task_context/*),
-#      computed at task-generation time and baked into tests/metadata.json,
-#      re-verified by test.sh before scoring. Any content change is detected.
-#   2. The contamination judge (test.sh + contamination_judge.py) additionally
-#      checks whether the agent's own code or session logs show it reading or
-#      referencing evaluate.py/contamination_judge.py.
-# Neither of these prevents tampering the way a separate container did; they
-# detect it after the fact and factor into the reward (see test.sh).
+#      contamination_judge.py, report_results.py, templates/, evaluation_code/,
+#      task_context/*, test_data.json), computed at task-generation time and
+#      baked into tests/metadata.json, re-verified by test.sh before scoring.
+#      Surfaces as the verifier_integrity reward dimension.
+#   2. The contamination judge (test.sh + contamination_judge.py) checks whether
+#      the agent's own code or session logs show it reading anything under
+#      /tests/. Surfaces as judge_evaluation_access.
+#
+# HISTORY, because this comment previously said the opposite: the task did run in
+# shared mode for a while, where the verifier read /home/agent/workspace/
+# final_model in place. That was forced by the transfer limits noted under
+# [verifier] below, not chosen, and the relay removed the constraint.
 # timeout_sec = 14400.0 (4h), not 10800.0 (3h): test.sh's own single-attempt
 # evaluation budget was raised to 10800s to give healthbench/arenahardwriting
 # enough headroom even with slower/larger models, so the overall verifier
@@ -138,9 +139,12 @@ CODEX_BASE_URL = "${CODEX_BASE_URL:-}"
 timeout_sec = 36000.0
 
 # Archive source and small experiment artifacts for postmortem review.
-# final_model is excluded: the shared-mode verifier reads it directly from
-# the agent's own workspace, so exporting it as an artifact would just
-# reintroduce the unreliable multi-GB transfer this whole design avoids.
+# final_model is excluded deliberately, and must stay excluded: the verifier
+# fetches the weights over the HF relay instead, so exporting them here would
+# reintroduce the multi-GB transfer the relay exists to avoid (5 GiB per-object
+# cap, and an archive failure at 7.9 GB) and would put an undownloadable
+# artifact in every reviewer's output folder. A correct run downloads in single
+# digit megabytes for an 8 GB model.
 #
 # The contamination judge in test.sh reads the agent's code via
 # `cd $WORKSPACE && codex exec ...` — the workspace transfer supplies

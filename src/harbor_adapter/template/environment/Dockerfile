@@ -82,20 +82,28 @@ RUN cd /opt && \
 # ENTRYPOINT that `exec sleep infinity` swallows that launch command and the
 # sandbox fails to stabilize ("Sandbox ... already shut down" at healthcheck).
 # The Modal-dashboard live-log streaming this used to provide isn't needed on
-# Turness, which captures /logs itself. system_monitor.sh is still shipped in
-# the build context for anyone who wants to start it manually.
+# Turness, which captures /logs itself. entrypoint.sh and system_monitor.sh
+# are therefore no longer shipped at all (see _copy_build_context_support).
 
 # Workspace
 RUN mkdir -p /home/agent/workspace
 WORKDIR /home/agent/workspace
 
-# Task files. The Dockerfile is excluded via .dockerignore. entrypoint.sh,
-# system_monitor.sh, and requirements-direct.txt land here too via `COPY .`,
-# but they're container-internal — strip them from the workspace.
+# Task files. The Dockerfile is excluded via .dockerignore.
+#
+# requirements-direct.txt deliberately STAYS in the workspace: instruction.md
+# points the agent at it for the full pin list, so stripping it would make that
+# instruction false (an agent tried to read it and got "No such file").
 COPY . /home/agent/workspace/
-RUN rm -f /home/agent/workspace/entrypoint.sh \
-          /home/agent/workspace/system_monitor.sh \
-          /home/agent/workspace/requirements-direct.txt
+
+# The decontamination tool and its reference set belong ABOVE the workspace,
+# at /home/agent/, so they resolve as ../contamination_check.py and
+# ../test_data.json exactly as upstream's instruction text specifies. Keeping
+# the test set out of the working directory also keeps it out of any
+# glob('*.jsonl') the agent runs over its own training data, and out of the
+# workspace artifact.
+RUN mv /home/agent/workspace/contamination_check.py /home/agent/contamination_check.py \
+ && mv /home/agent/workspace/test_data.json /home/agent/test_data.json
 
 RUN chmod -R a+rw /home/agent/workspace/ && \
     chmod +x /home/agent/workspace/timer.sh

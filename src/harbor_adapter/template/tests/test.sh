@@ -157,6 +157,7 @@ write_reward_dimensions() {
     D_J_API="$J_API_USAGE"                  D_JR_API="$JR_API_USAGE" \
     D_J_LOOKUP="$J_PTB_LOOKUP"              D_JR_LOOKUP="$JR_PTB_LOOKUP" \
     python3 - "$LOGS_DIR/reward.json" <<'PY'
+import decimal
 import json
 import os
 import sys
@@ -202,6 +203,69 @@ dimensions = {
     "judge_ptb_lookup": flag("D_J_LOOKUP"),
     "judge_runtime_ptb_lookup": flag("D_JR_LOOKUP"),
 }
+
+# The score, in the top-of-page dimension list.
+#
+# READ THIS BEFORE EDITING. Both VALUES are hardcoded 1.0 and must stay that way.
+# Data-OS fails a run if ANY dimension is below 1.0, so a dimension holding the
+# real accuracy (~0.15 on a healthy baseline) would fail every Oracle and every
+# agent run. The number therefore travels in the KEY NAME, where it is displayed
+# but not compared. These dimensions can never fail and never change a verdict.
+#
+# TWO DECIMALS HERE, FULL PRECISION IN THE GRID. Data-OS orders this list by
+# (name length, alphabetically) -- observed across the 22 gate dimensions of
+# eval_154038 -- so the key length decides where the number appears on the page.
+# "acc_pct_15_00" (13 chars) renders 5th; the unrounded
+# "acc_pct_15_001315837013632" (26 chars) sinks to near the bottom, which is the
+# "not prominent enough" problem again. report_results.py therefore carries the
+# exact unrounded percentage in the first row of the test grid, and this list
+# carries the readable summary. Changing either changes what a reviewer sees.
+#
+# Names are chosen so accuracy always sorts ahead of stderr: acc_pct_* is
+# shorter than stderr_pct_* at every plausible value.
+#
+# Truncated, never rounded up: 0.09999 -> 9_99, not 10_00, so the displayed
+# figure cannot overstate performance. Decimal rather than float because
+# 0.09999 * 100 in IEEE binary is 9.998999999999999.
+#
+# A metric is omitted entirely when unusable -- including from fail_and_exit(),
+# which writes a plain error string to metrics.json rather than JSON, and from
+# benchmarks whose scorer reports no stderr (BFCL). The grid's own rows report
+# those cases, so a missing key here is never the only signal.
+metrics_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "metrics.json")
+try:
+    with open(metrics_path) as handle:
+        reported = json.load(handle)
+    if not isinstance(reported, dict):
+        reported = {}
+except (OSError, ValueError):
+    reported = {}
+
+# An aborted run is NOT a zero score, and must not be displayed as one.
+#
+# fail_and_exit() writes {"error": "...", "accuracy": 0} on all five of its
+# paths, so the accuracy key exists even when no evaluation ever ran. Reading it
+# blindly produced `acc_pct_0_00` on eval_176882 -- a run that died at the model
+# transfer -- which renders on the run page as "0.00%" and reads as "the model
+# scored zero" rather than "no model was ever evaluated". That is misleading
+# evidence on a QC surface, which is exactly what these dimensions must not be.
+#
+# The grid's own accuracy row reports the abort as a FAILED row, so suppressing
+# the dimensions here loses no information.
+if "error" in reported:
+    reported = {}
+
+for metric_name, key_prefix in (("accuracy", "acc_pct_"), ("stderr", "stderr_pct_")):
+    if metric_name not in reported:
+        continue
+    try:
+        scaled = decimal.Decimal(repr(float(reported[metric_name]))) * 100
+        label = format(
+            scaled.quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_DOWN), "f"
+        )
+    except (ValueError, TypeError, ArithmeticError):
+        continue
+    dimensions[key_prefix + label.replace(".", "_").replace("-", "neg")] = 1.0
 
 with open(sys.argv[1], "w") as handle:
     json.dump(dimensions, handle, indent=2)
@@ -725,6 +789,18 @@ if [ -f "$TESTS/contamination_judge.py" ] && [ -n "$BENCHMARK_NAME" ]; then
         # CODEX_BASE_URL wins if set (thread it through [verifier.env] with a
         # ${VAR:-} guard). CODEX_REGION is kept as an opt-IN for regional
         # deployments; it no longer applies unless explicitly set.
+        #
+        # NEITHER DEFAULT IS SAFE ON ITS OWN, which is why the retry loop below
+        # can correct this choice at runtime. Whether a key needs the plain host
+        # or a regional one is a property of the OpenAI project, is not
+        # discoverable up front, and is not set by the platform:
+        #   eval_150839  defaulted REGIONAL, an ordinary key -> 401 "make your
+        #                request to api.openai.com", both attempts burned
+        #   eval_158231  defaulted PLAIN, a data-residency key -> "incorrect
+        #                regional hostname ... make your request to
+        #                us.api.openai.com", both attempts burned again
+        # Same bug, opposite direction. The API response names the host it wants,
+        # so the loop parses it and switches rather than guessing better.
         if [ -n "${CODEX_BASE_URL:-}" ]; then
             JUDGE_BASE_URL="$CODEX_BASE_URL"
         elif [ -n "${CODEX_REGION:-}" ]; then
@@ -732,16 +808,34 @@ if [ -f "$TESTS/contamination_judge.py" ] && [ -n "$BENCHMARK_NAME" ]; then
         else
             JUDGE_BASE_URL="https://api.openai.com/v1"
         fi
-        echo "Judge endpoint: $JUDGE_BASE_URL"
 
-        mkdir -p "$HOME/.codex"
-        cat > "$HOME/.codex/config.toml" <<EOF
+        # A function, not an inline heredoc: the retry loop rewrites this file
+        # when the API redirects us to a different host.
+        write_codex_config() {
+            mkdir -p "$HOME/.codex"
+            cat > "$HOME/.codex/config.toml" <<EOF
 [model_providers.region_openai]
 name = "region_openai"
 base_url = "${JUDGE_BASE_URL}"
 env_key = "CODEX_API_KEY"
 wire_api = "responses"
 EOF
+            echo "Judge endpoint: $JUDGE_BASE_URL"
+        }
+
+        # Pull the host out of a regional-routing rejection, if that is what
+        # failed. Returns nothing for any other error, so an ordinary timeout
+        # never triggers an endpoint change.
+        #
+        # The character class deliberately excludes the quote and paren that
+        # close the JSON string, so the host comes out clean without needing a
+        # JSON parse of a log that may be truncated mid-write.
+        regional_redirect_host() {
+            grep -o 'Please make your request to [A-Za-z0-9.-]*' "$1" 2>/dev/null \
+                | head -1 | awk '{print $NF}' | sed 's/\.*$//'
+        }
+
+        write_codex_config
         # codex CLI 0.120.0+ waits for stdin to close even when the prompt is
         # passed as an argv positional (it treats a non-TTY stdin as a
         # possible second input block). In a script, stdin never closes, so
@@ -763,9 +857,17 @@ EOF
         JUDGE_ATTEMPT=1
         JUDGE_DELIVERED=0
         JUDGE_EXIT_CODE=0
+        # Log filenames advance on every codex invocation, including a
+        # redirect-corrected one, so no attempt's evidence is overwritten.
+        JUDGE_RUN=1
+        # At most one endpoint correction. A redirect is a misconfiguration
+        # rather than a transport failure, so it does NOT consume an attempt --
+        # but it must be able to happen only once, or a server that keeps
+        # redirecting would spin here forever.
+        JUDGE_REDIRECTS_LEFT=1
 
         while [ "$JUDGE_ATTEMPT" -le "$JUDGE_MAX_ATTEMPTS" ]; do
-            echo "Judge attempt $JUDGE_ATTEMPT of $JUDGE_MAX_ATTEMPTS"
+            echo "Judge attempt $JUDGE_ATTEMPT of $JUDGE_MAX_ATTEMPTS (run $JUDGE_RUN)"
 
             # Clear any prior verdicts before every attempt. The agent's
             # workspace is re-materialized in this container from its
@@ -782,9 +884,11 @@ EOF
                 codex --search -a never exec --json -c model_reasoning_summary=detailed \
                 -c model_provider="region_openai" \
                 --skip-git-repo-check --yolo --model "${CODEX_JUDGE_MODEL:-gpt-5.1}" "$JUDGE_TASK" < /dev/null \
-                2>&1 | tee "$LOGS_DIR/judge_output_attempt_${JUDGE_ATTEMPT}.json"
+                2>&1 | tee "$LOGS_DIR/judge_output_attempt_${JUDGE_RUN}.json"
             JUDGE_EXIT_CODE=$?
             echo "Judge exit code: $JUDGE_EXIT_CODE"
+            JUDGE_LAST_LOG="$LOGS_DIR/judge_output_attempt_${JUDGE_RUN}.json"
+            JUDGE_RUN=$((JUDGE_RUN + 1))
 
             # "Delivered" means codex exited cleanly AND wrote ALL FIVE
             # verdicts.
@@ -808,22 +912,49 @@ EOF
             fi
             [ -n "$JUDGE_MISSING" ] && echo "Missing verdict file(s):$JUDGE_MISSING"
 
+            # Endpoint correction, before charging this to the attempt budget.
+            # The API tells us which host it wants; believe it rather than
+            # re-running against the same wrong one, which is what burned both
+            # attempts in eval_150839 and again in eval_158231.
+            JUDGE_REDIRECT_HOST=$(regional_redirect_host "$JUDGE_LAST_LOG")
+            JUDGE_REDIRECT_URL=""
+            [ -n "$JUDGE_REDIRECT_HOST" ] && JUDGE_REDIRECT_URL="https://${JUDGE_REDIRECT_HOST}/v1"
+            if [ "$JUDGE_REDIRECTS_LEFT" -gt 0 ] \
+               && [ -n "$JUDGE_REDIRECT_URL" ] \
+               && [ "$JUDGE_REDIRECT_URL" != "$JUDGE_BASE_URL" ]; then
+                echo "Judge rejected $JUDGE_BASE_URL as the wrong regional host."
+                echo "The API asked for $JUDGE_REDIRECT_HOST; switching and retrying."
+                echo "This does not consume a retry attempt: it is a"
+                echo "misconfiguration, not a transport failure."
+                JUDGE_BASE_URL="$JUDGE_REDIRECT_URL"
+                JUDGE_REDIRECTS_LEFT=$((JUDGE_REDIRECTS_LEFT - 1))
+                write_codex_config
+                continue
+            fi
+
             echo "Judge attempt $JUDGE_ATTEMPT delivered no verdict (exit $JUDGE_EXIT_CODE)."
             echo "Treating as a transport failure, not as a finding."
             JUDGE_ATTEMPT=$((JUDGE_ATTEMPT + 1))
         done
 
-        # Keep the historical filename pointing at whichever attempt we used,
-        # so existing tooling and QC steps keep working unchanged.
-        LAST_JUDGE_OUTPUT="$LOGS_DIR/judge_output_attempt_$((JUDGE_ATTEMPT > JUDGE_MAX_ATTEMPTS ? JUDGE_MAX_ATTEMPTS : JUDGE_ATTEMPT)).json"
-        [ -f "$LAST_JUDGE_OUTPUT" ] && cp "$LAST_JUDGE_OUTPUT" "$LOGS_DIR/judge_output.json"
+        # Keep the historical filename pointing at whichever run we used, so
+        # existing tooling and QC steps keep working unchanged. Tracked by
+        # variable rather than recomputed from the attempt counter: a
+        # redirect-corrected run advances the log number without advancing the
+        # attempt, so arithmetic on JUDGE_ATTEMPT would name the wrong file.
+        [ -n "${JUDGE_LAST_LOG:-}" ] && [ -f "$JUDGE_LAST_LOG" ] \
+            && cp "$JUDGE_LAST_LOG" "$LOGS_DIR/judge_output.json"
 
         if [ "$JUDGE_DELIVERED" -eq 0 ]; then
-            CONTAMINATION_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
-            DISALLOWED_MODEL_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
-            EVAL_ACCESS_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
-            API_USAGE_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
-            PTB_LOOKUP_VERDICT="judge unavailable (codex exited with $JUDGE_EXIT_CODE)"
+            # Name the endpoint in the verdict. Both times this failed, the
+            # cause was the endpoint and the only way to see that was to open
+            # judge_output.json and read past five reconnect lines.
+            JUDGE_UNAVAILABLE_REASON="judge unavailable (codex exited with $JUDGE_EXIT_CODE, endpoint $JUDGE_BASE_URL)"
+            CONTAMINATION_VERDICT="$JUDGE_UNAVAILABLE_REASON"
+            DISALLOWED_MODEL_VERDICT="$JUDGE_UNAVAILABLE_REASON"
+            EVAL_ACCESS_VERDICT="$JUDGE_UNAVAILABLE_REASON"
+            API_USAGE_VERDICT="$JUDGE_UNAVAILABLE_REASON"
+            PTB_LOOKUP_VERDICT="$JUDGE_UNAVAILABLE_REASON"
         else
             if [ -f "$WORKSPACE/contamination_judgement.txt" ]; then
                 CONTAMINATION_VERDICT=$(cat "$WORKSPACE/contamination_judgement.txt")
@@ -1116,6 +1247,36 @@ else
 fi
 
 echo "$REWARD" > "$LOGS_DIR/reward.txt"
+
+# ============================================================
+# Per-test breakdown for the Data-OS run page.
+#
+# Data-OS grades on reward.json alone: "a run passes only when every dimension
+# scores 1.0". The benchmark accuracy therefore cannot be a dimension -- a
+# healthy 0.15 baseline would fail the run, and a clean-but-weak run is
+# supposed to stay VALID. The per-test grid is the display-only channel that
+# "does not change the pass/fail decision", so the accuracy goes there.
+#
+# Data-OS builds that grid from this script's console output, which Harbor
+# already captures wholesale into test-stdout.txt -- nothing needs redirecting.
+# Real pytest is used rather than hand-printed lines so the format is whatever
+# their parser was written against, not our guess at it.
+#
+# Runs LAST, reads only files that are already final, and is wrapped so it can
+# never influence the outcome:
+#   - `|| true` so a failed assertion cannot change test.sh's exit status
+#   - reward.txt and reward.json are already written above
+# Absent pytest (or on any error) the grid simply falls back to one row per
+# reward dimension, which is what it was before this block existed.
+echo ""
+echo "=== Per-test breakdown (display only; reward is already final) ==="
+if [ -f "$TESTS/report_results.py" ] && python3 -c "import pytest" 2>/dev/null; then
+    PTB_REPORT_DIR="$LOGS_DIR" python3 -m pytest "$TESTS/report_results.py" \
+        -rA -v -p no:cacheprovider --no-header 2>&1 || true
+else
+    echo "pytest or report_results.py unavailable; Data-OS will fall back to"
+    echo "one grid row per reward dimension."
+fi
 
 echo ""
 echo "=== Verification complete ==="

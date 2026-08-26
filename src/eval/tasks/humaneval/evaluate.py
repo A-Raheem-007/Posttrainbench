@@ -88,6 +88,12 @@ def main() -> None:
         attempt_timeout=300,
         max_tokens=args.max_tokens,
         max_connections=args.max_connections,
+        # Stop at the chat template's own turn terminator. Reaches vLLM's
+        # sampling params by the same route max_tokens above already takes, so
+        # this is not a new mechanism, just a field that was never set.
+        # Without it generation never terminates cleanly; see
+        # TEMPLATE_STOP_SEQS.
+        stop_seqs=template_stop_seqs(args),
         **other_kwargs,
     )
 
@@ -130,6 +136,38 @@ def model_type(args) -> str:
     if 'smollm' in architecture:
         return 'smollm'
     raise ValueError(architecture)
+
+# Turn terminators used by the chat templates in templates/.
+#
+# These are NOT the base models' eos_token_id. Qwen3-*-Base stops on
+# <|endoftext|> (151643) while qwen3.jinja ends every turn with <|im_end|>
+# (151645), and the same split exists for the other families. Nothing tells
+# vLLM about the template's terminator, so generation runs straight past it.
+#
+# Measured on GSM8K (eval_194142, a Qwen3-1.7B-Base fine-tune). The agent
+# trained through the base tokenizer's own ChatML template, so the fine-tune
+# closed each answer with <|im_end|> -- which is not its eos_token_id. 997 of
+# 1319 samples ran to the max_tokens cap, inventing fresh problems after the
+# real answer. inspect's match(numeric=True) reads the tail, so it scored the
+# invented answers. 310 samples carried the correct answer on their own
+# ANSWER line and were marked wrong: 3.11% reported against a 12.89%
+# untrained baseline, for a model measurably better than that baseline.
+# Found first on BFCL (eval_153283, 96 of 100 samples truncated). It maps a
+# better model onto a worse number, so it is a measurement defect, not a
+# capability result.
+TEMPLATE_STOP_SEQS = {
+    "qwen3.jinja": ["<|im_end|>"],
+    "llama3.jinja": ["<|eot_id|>"],
+    "gemma3.jinja": ["<end_of_turn>"],
+    "smollm.jinja": ["<|im_end|>"],
+}
+
+
+def template_stop_seqs(args) -> list:
+    """Stop sequences for the chat template this model will be served with."""
+    template = os.path.basename(template_kwargs(args)["chat_template"])
+    return TEMPLATE_STOP_SEQS.get(template, [])
+
 
 def template_kwargs(args) -> dict:
     model_type_str = model_type(args)

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run the REAL test.sh end to end against a simulated clean run, and require
-# all 22 reward dimensions to come back 1.0.
+# every reward dimension to come back 1.0. That is 24 on a clean run: the
+# 22 gates plus the two display-only score dimensions.
 #
 # WHY THIS EXISTS
 # Four separate bugs reached production because the ordinary success path was
@@ -193,6 +194,57 @@ if bad:
             print(f"  {name}: {f.read_text(encoding='utf-8', errors='ignore').strip()[:200]}")
     sys.exit(1)
 print(f"ALL {len(r)} DIMENSIONS PASS")
+
+# The accuracy reaches the Data-OS run page ONLY through the per-test grid,
+# because a reward dimension below 1.0 fails the whole run and a real accuracy
+# never is 1.0. That grid is built from this script's console output, so if the
+# pytest block stops printing rows the number silently disappears from the UI
+# and nothing else in this suite would notice: reward.json is byte-identical
+# either way. Assert on the console text, which is what Data-OS actually parses.
+log = (root / "run.log").read_text(encoding="utf-8", errors="ignore")
+expected_metric = "accuracy=42%"           # stubbed 0.42, exact and unrounded
+expected_dim = "test_reward_dimension[model_identity]"
+missing = [s for s in (expected_metric, expected_dim) if s not in log]
+
+# The accuracy row must come BEFORE the dimension rows. It is the number the
+# reviewer opened the page for, and pytest orders by definition order, so
+# reordering the functions in report_results.py silently buries it 22 rows down.
+if not missing:
+    first_metric = log.index(expected_metric)
+    first_dim = log.index("test_reward_dimension[reward]")
+    if first_metric > first_dim:
+        missing.append("accuracy row appears AFTER the dimension rows")
+
+if missing:
+    print(f"FAIL: per-test grid wrong: {missing}")
+    print("      (Data-OS would fall back to one row per reward dimension and")
+    print("       the accuracy would not appear on the run page)")
+    tail = [ln for ln in log.splitlines() if "pytest" in ln or "report_results" in ln]
+    for ln in tail[-12:]:
+        print("      " + ln)
+    sys.exit(1)
+print(f"PER-TEST GRID OK ({expected_metric} first, dimension rows after)")
+
+# The top-of-page dimension list. The numbers ride in the KEYS at two decimals;
+# the VALUES are pinned to 1.0 because any dimension below 1.0 fails the whole
+# run. Both stub harnesses report accuracy 0.42 and stderr 0.01.
+score_dims = {k: v for k, v in r.items()
+              if k.startswith("acc_pct_") or k.startswith("stderr_pct_")}
+if sorted(score_dims) != ["acc_pct_42_00", "stderr_pct_1_00"]:
+    print(f"FAIL: expected acc_pct_42_00 + stderr_pct_1_00, got {sorted(score_dims)}")
+    sys.exit(1)
+not_one = {k: v for k, v in score_dims.items() if v != 1.0}
+if not_one:
+    print(f"FAIL: score dimension(s) not pinned to 1.0: {not_one} "
+          f"-- this would fail every run")
+    sys.exit(1)
+# Accuracy must read before its own error bar in the length-then-alpha ordering.
+order = sorted(r, key=lambda s: (len(s), s))
+if order.index("acc_pct_42_00") > order.index("stderr_pct_1_00"):
+    print("FAIL: stderr sorts ahead of accuracy in the Data-OS dimension list")
+    sys.exit(1)
+print(f"TOP-GRID SCORES OK (acc_pct_42_00 + stderr_pct_1_00, both 1.0, "
+      f"accuracy at {order.index('acc_pct_42_00') + 1} of {len(order)})")
 PY
 status=$?
 rm -rf "$ROOT"

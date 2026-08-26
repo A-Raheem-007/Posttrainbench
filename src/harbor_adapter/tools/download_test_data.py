@@ -144,7 +144,27 @@ def download_gsm8k():
 
 
 def _parse_healthbench_jsonl(raw_bytes: bytes) -> list[dict]:
-    """Parse healthbench JSONL bytes into normalized items."""
+    """Parse healthbench JSONL bytes into normalized items.
+
+    The `answer` field is deliberately left EMPTY. Healthbench has no reference
+    answer; what the source file carries instead is the grading rubric, e.g.
+    `{"criterion": "Highlights the limited evidence ...", "points": 7, ...}`.
+    Putting that in the reference set was wrong twice over:
+
+      1. It is the marking scheme. Since the agent now receives a copy of this
+         file as its decontamination reference (v1.1), shipping the rubrics
+         would hand it the exact criteria and point weights for all 245 scored
+         examples, which is considerably more than the test questions.
+      2. It made the scan WORSE, not better. Measured with the real checker: a
+         training row reproducing a test prompt was MISSED with the 1.7 KB
+         rubric present and CAUGHT with it removed, because the rubric swamps
+         the match. False positives were zero either way, including across a
+         200-row honest medical corpus.
+
+    So the rubric is dropped from both the verifier's copy and the agent's.
+    Contamination for this benchmark means training on the prompts, and the
+    prompts are what remains.
+    """
     items = []
     for line in raw_bytes.decode("utf-8").splitlines():
         line = line.strip()
@@ -153,32 +173,47 @@ def _parse_healthbench_jsonl(raw_bytes: bytes) -> list[dict]:
         obj = json.loads(line)
         prompt = obj.get("prompt", obj.get("conversation", []))
         prompt_str = json.dumps(prompt, ensure_ascii=False) if not isinstance(prompt, str) else prompt
-        rubrics = obj.get("rubrics", obj.get("criteria", []))
-        rubrics_str = json.dumps(rubrics, ensure_ascii=False) if not isinstance(rubrics, str) else rubrics
         prompt_id = obj.get("prompt_id", "")
-        items.append({"question": prompt_str, "answer": rubrics_str, "_prompt_id": prompt_id})
+        items.append({"question": prompt_str, "answer": "", "_prompt_id": prompt_id})
     return items
 
 
 def download_healthbench():
-    log("Downloading healthbench from Azure blob (openai/simple-evals)...")
-    urls = [
-        "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/2025-05-07-06-14-12_oss_eval.jsonl",
-    ]
+    """Build healthbench's reference set from the file the EVALUATOR scores.
+
+    Deliberately NOT the full oss_eval blob. The evaluator loads
+    evaluation_code/data/healthbench.jsonl, which is HealthBench Easy at 245
+    examples; the blob is the full 5000-row set. Scanning against the blob was
+    wrong in both directions:
+
+      - it scored contamination against 4755 items that are never evaluated,
+        which cannot affect the benchmark result either way, and
+      - it produced a 25.85 MB tests/test_data.json, over Data-OS's 20 MB
+        per-file limit, so healthbench tasks were rejected at upload.
+
+    All 245 scored examples are present in the 5000 (verified by prompt text),
+    so narrowing to the scored file loses nothing relevant and makes the
+    reference set track the evaluator by construction rather than by luck.
+    """
+    src = TASKS_DIR / "healthbench" / "evaluation_code" / "data" / "healthbench.jsonl"
+    if not src.is_file():
+        raise FileNotFoundError(
+            f"{src} not found. healthbench's reference set is derived from the "
+            f"evaluator's own data file so the two cannot drift apart."
+        )
+    log(f"Building healthbench reference set from {src} (the scored set)...")
+    items = _parse_healthbench_jsonl(src.read_bytes())
+
     seen_ids = set()
     data = []
-    for url in urls:
-        log(f"  Fetching {url}")
-        with urllib.request.urlopen(url) as resp:
-            items = _parse_healthbench_jsonl(resp.read())
-        for item in items:
-            pid = item.pop("_prompt_id")
-            if pid and pid in seen_ids:
-                continue
-            if pid:
-                seen_ids.add(pid)
-            data.append(item)
-        log(f"    Got {len(items)} items, {len(data)} total after dedup")
+    for item in items:
+        pid = item.pop("_prompt_id")
+        if pid and pid in seen_ids:
+            continue
+        if pid:
+            seen_ids.add(pid)
+        data.append(item)
+    log(f"    Got {len(items)} items, {len(data)} after dedup")
 
     save_test_data("healthbench", data)
 

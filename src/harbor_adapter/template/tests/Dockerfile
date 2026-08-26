@@ -1,13 +1,14 @@
 FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
-# Optional verifier image for installations that switch this task back to
-# Harbor's separate-verifier mode (PR #1655) after upgrading to a reliable
-# tar-based artifact transfer. The shipped task uses
-# [verifier].environment_mode = "shared" (see task.toml), where Harbor runs
-# the verifier inside the agent's own container and copies tests/ into
-# /tests at runtime instead of building this image — so this Dockerfile is
-# NOT built or used for normal evaluation today. Kept in sync anyway so the
-# switch back is a one-line task.toml edit, not a rebuild-from-scratch.
+# The verifier image. The shipped task sets
+# [verifier].environment_mode = "separate" (see task.toml), so Harbor BUILDS
+# this Dockerfile and runs the verifier in its own container, isolated from the
+# agent. That is the reference pipeline's design and what the client requires.
+#
+# (This header previously said the task ran in "shared" mode and that this file
+# was therefore unused. That stopped being true when the HF relay removed the
+# 5 GiB artifact cap that had forced shared mode; the comment outlived the
+# change. Anything editing this file is editing the image that actually runs.)
 #
 # Mirrors environment/Dockerfile (the agent image) so any Python the
 # verifier imports — vllm, transformers, inspect_evals — resolves
@@ -59,6 +60,15 @@ RUN uv pip install --system --no-cache vllm==0.11.0 --torch-backend=cu128
 COPY requirements-direct.txt /opt/requirements-direct.txt
 RUN uv pip install --system --no-cache -r /opt/requirements-direct.txt
 
+# pytest is used ONLY by report_results.py, which re-presents the finished
+# reward.json and metrics.json as the per-test grid Data-OS shows on the run
+# page (that grid is display-only and cannot affect the reward). Pinned and
+# installed explicitly rather than relied on transitively: nothing in
+# requirements-direct.txt declares pytest, so its presence today would be an
+# accident of resolution and test.sh's `import pytest` guard would silently
+# drop the accuracy row the day it resolved differently.
+RUN uv pip install --system --no-cache pytest==8.4.2
+
 RUN uv pip install --system --no-cache flash-attn==2.8.3 --no-build-isolation
 
 # Codex CLI (contamination judge). Other agent CLIs deliberately omitted —
@@ -88,12 +98,10 @@ WORKDIR /home/agent/workspace
 # Bake the entire tests/ build context (test.sh, evaluate.py, templates/,
 # evaluation_code/, contamination_judge.py, metadata.json, and any
 # task_context/* files the adapter dropped in) into /tests/.
-# entrypoint.sh / system_monitor.sh / requirements-direct.txt land here
-# too via `COPY .`; they're already installed elsewhere, so strip them
-# from /tests/ to keep test.sh's listing clean.
+# requirements-direct.txt lands here too via `COPY .`. It is stripped on this
+# side because the verifier has no agent to inform; the AGENT image keeps its
+# copy, since instruction.md points the agent at it for the full pin list.
 COPY . /tests/
 RUN rm -f /tests/Dockerfile \
-          /tests/entrypoint.sh \
-          /tests/system_monitor.sh \
           /tests/requirements-direct.txt && \
     chmod +x /tests/test.sh
